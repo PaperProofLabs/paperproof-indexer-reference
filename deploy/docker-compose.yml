@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: paperproof
+      POSTGRES_USER: paperproof
+      POSTGRES_PASSWORD: paperproof
+    ports:
+      - "5432:5432"
+    volumes:
+      - paperproof-postgres:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ..
+    environment:
+      PAPERPROOF_INDEXER_POSTGRES_URL: postgres://paperproof:paperproof@postgres:5432/paperproof
+      RUST_LOG: paperproof_indexer_reference=info,paperproof_sdk_rs=info
+    ports:
+      - "8787:8787"
+    depends_on:
+      - postgres
+    command: ["paperproof-indexer-reference", "serve", "--bind", "0.0.0.0:8787"]
+
+volumes:
+  paperproof-postgres:

@@ -1,0 +1,10 @@
+[
+  {
+    "source_event_key": "example-event",
+    "artifact_id": "0xexample",
+    "version_id": "0xversion",
+    "blob_id": "example-walrus-blob-id",
+    "expected_sha256_hex": null,
+    "content_type": "text/plain"
+  }
+]
