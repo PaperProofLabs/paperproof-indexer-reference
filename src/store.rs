@@ -310,6 +310,7 @@ pub async fn build_event_sink(
     output_dir: &str,
     prefix: &str,
 ) -> paperproof_sdk_rs::Result<Box<dyn PaperProofEventSink>> {
+    ensure_output_dir(output_dir)?;
     match sink {
         "jsonl" => Ok(Box::new(JsonlEventSink::new(
             format!("{output_dir}/{prefix}-accepted.jsonl"),
@@ -328,6 +329,7 @@ pub async fn build_cursor_store(
     sink: &str,
     output_dir: &str,
 ) -> paperproof_sdk_rs::Result<Box<dyn IndexerCursorStore>> {
+    ensure_output_dir(output_dir)?;
     match sink {
         "jsonl" => Ok(Box::new(FileCursorStore::new(cursor_path(output_dir))?)),
         "sqlite" => sqlite_cursor_store(output_dir),
@@ -341,6 +343,11 @@ pub async fn build_cursor_store(
 
 fn cursor_path(output_dir: &str) -> PathBuf {
     Path::new(output_dir).join("cursor.json")
+}
+
+fn ensure_output_dir(output_dir: &str) -> paperproof_sdk_rs::Result<()> {
+    std::fs::create_dir_all(output_dir)
+        .map_err(|err| PaperProofError::network(output_dir, err.to_string()))
 }
 
 #[cfg(feature = "sqlite")]

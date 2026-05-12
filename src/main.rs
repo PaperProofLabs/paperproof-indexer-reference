@@ -492,6 +492,8 @@ async fn record_checkpoint_metrics(
     output_dir: &str,
     metrics: &paperproof_sdk_rs::IndexerMetrics,
 ) -> paperproof_sdk_rs::Result<()> {
+    let _ = output_dir;
+    let _ = metrics;
     match sink {
         "sqlite" => {
             #[cfg(feature = "sqlite")]
