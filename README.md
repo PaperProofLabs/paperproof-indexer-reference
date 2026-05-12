@@ -3,7 +3,8 @@
 Reference indexer implementation for PaperProof Protocol.
 
 This repository is not the only valid PaperProof indexer. It is an official
-reference implementation that demonstrates how to consume canonical PaperProof
+reference implementation, not an exclusive or canonical data source. It
+demonstrates how to consume canonical PaperProof
 events, store replayable raw facts, derive normalized/domain state, and
 optionally enrich Walrus content. Third-party teams are encouraged to fork,
 replace modules, add their own reducers, and build their own APIs or search
@@ -27,7 +28,7 @@ pipelines.
 
 ## What It Is Not
 
-- Not the only official data source for PaperProof.
+- Not an exclusive or canonical data source for PaperProof.
 - Not a mandatory service for using PaperProof Protocol.
 - Not a final ranking, search, moderation, or recommendation system.
 - Not a replacement for independent third-party indexers.
@@ -243,3 +244,19 @@ The code is Apache-2.0. You may fork and modify it. The PaperProof name, marks,
 official deployment identity, and official-indexer claims are not granted by the
 software license. If you publish a fork, make its modified or unofficial status
 clear to users.
+
+PaperProof Protocol refers to the open protocol layer and official deployed
+protocol instances. PaperProof Labs refers to the originating team and
+maintainer of the official interface, SDKs, reference indexer, documentation,
+and brand identity.
+
+The Apache-2.0 license applies to this reference indexer code. It does not grant
+rights to PaperProof trademarks, official status, official deployment authority,
+protocol governance authority, protected PaperProof contract source, protected
+official app source, or protected PaperProof documentation and brand materials.
+
+You may build independent indexers, APIs, dashboards, analytics systems, airdrop
+pipelines, search tools, and community-specific views. If your service claims
+compatibility with official PaperProof deployments, keep canonical validation,
+deployment drift checks, rejected-event tracking, and clear unofficial-status
+disclosure in place.
