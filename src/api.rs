@@ -9,7 +9,11 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 use crate::analytics::{AirdropSnapshotPlan, AnalyticsSummary};
 use crate::metrics::IndexerMetricSnapshot;
@@ -18,6 +22,12 @@ use crate::normalized::NormalizedQuery;
 use crate::normalized::{
     ActivityRecord, AirdropRow, ArtifactRecord, CommentRecord, GovernanceProposalRecord,
     GovernanceVoteRecord, VersionRecord,
+};
+use crate::official_content::{
+    OfficialBlogManifest, OfficialContentCache, OfficialContentConfig, OfficialContentResponse,
+    OfficialContentService, OfficialContentWarmupReport, OfficialDocsManifest,
+    OfficialForumManifest, blog_entries, blog_entry, docs_entries, docs_entry, forum_entries,
+    forum_entry, official_cache_key,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -33,11 +43,25 @@ impl Default for ApiConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ApiState {
     pub analytics: AnalyticsSummary,
     pub sqlite_path: Option<String>,
     pub postgres_url: Option<String>,
+    pub official_content: OfficialContentConfig,
+    pub official_cache: OfficialContentCache,
+}
+
+impl Default for ApiState {
+    fn default() -> Self {
+        Self {
+            analytics: AnalyticsSummary::default(),
+            sqlite_path: None,
+            postgres_url: None,
+            official_content: OfficialContentConfig::default(),
+            official_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -114,6 +138,7 @@ impl IntoResponse for ApiError {
 }
 
 pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sdk_rs::Result<()> {
+    spawn_official_content_warmup(state.clone());
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/analytics/summary", get(analytics))
@@ -130,6 +155,13 @@ pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sd
         .route("/v1/my/{address}/artifacts", get(my_artifacts))
         .route("/v1/my/{address}/votes", get(my_votes))
         .route("/v1/airdrop/snapshot", get(airdrop_snapshot))
+        .route("/v1/official/docs/{section}", get(official_doc_section))
+        .route(
+            "/v1/official/docs/{section}/{topic}",
+            get(official_doc_topic),
+        )
+        .route("/v1/official/blog/{slug}", get(official_blog_post))
+        .route("/v1/official/forum/{slug}", get(official_forum_topic))
         .with_state(state);
     let listener = TcpListener::bind(&config.bind).await.map_err(|err| {
         paperproof_sdk_rs::PaperProofError::network(&config.bind, err.to_string())
@@ -325,6 +357,248 @@ async fn my_votes(
 
 async fn airdrop_snapshot(State(state): State<ApiState>) -> ApiResult<Vec<AirdropRow>> {
     Ok(Json(query(&state).await?.airdrop_rows().await?))
+}
+
+async fn official_doc_section(
+    State(state): State<ApiState>,
+    Path(section): Path<String>,
+) -> ApiResult<OfficialContentResponse> {
+    official_docs_response(state, section, None).await
+}
+
+async fn official_doc_topic(
+    State(state): State<ApiState>,
+    Path((section, topic)): Path<(String, String)>,
+) -> ApiResult<OfficialContentResponse> {
+    official_docs_response(state, section, Some(topic)).await
+}
+
+async fn official_docs_response(
+    state: ApiState,
+    section: String,
+    topic: Option<String>,
+) -> ApiResult<OfficialContentResponse> {
+    let slug = topic
+        .as_ref()
+        .map(|topic| format!("{section}/{topic}"))
+        .unwrap_or_else(|| section.clone());
+    if let Some(cached) = cached_official_content(&state, "docs", &slug).await {
+        return Ok(Json(cached));
+    }
+    let service = OfficialContentService::new(state.official_content.clone());
+    let manifest = service
+        .load_manifest::<OfficialDocsManifest>("docs/manifest.json")
+        .await?;
+    let entry = docs_entry(manifest, &section, topic.as_deref()).ok_or_else(|| {
+        paperproof_sdk_rs::PaperProofError::invalid_input("official docs slug", "entry not found")
+    })?;
+    let series_id = entry.series_id.clone().ok_or_else(|| {
+        paperproof_sdk_rs::PaperProofError::invalid_input(
+            "seriesId",
+            "official docs entry has no seriesId",
+        )
+    })?;
+    let versions = official_versions_or_empty(&state, &series_id).await;
+    let rendered = service.render_entry("docs", &slug, entry, versions).await?;
+    cache_official_content(&state, &rendered).await;
+    Ok(Json(rendered))
+}
+
+async fn official_blog_post(
+    State(state): State<ApiState>,
+    Path(slug): Path<String>,
+) -> ApiResult<OfficialContentResponse> {
+    if let Some(cached) = cached_official_content(&state, "blog", &slug).await {
+        return Ok(Json(cached));
+    }
+    let service = OfficialContentService::new(state.official_content.clone());
+    let manifest = service
+        .load_manifest::<OfficialBlogManifest>("blog/manifest.json")
+        .await?;
+    let entry = blog_entry(manifest, &slug).ok_or_else(|| {
+        paperproof_sdk_rs::PaperProofError::invalid_input("official blog slug", "entry not found")
+    })?;
+    let series_id = entry.series_id.clone().ok_or_else(|| {
+        paperproof_sdk_rs::PaperProofError::invalid_input(
+            "seriesId",
+            "official blog entry has no seriesId",
+        )
+    })?;
+    let versions = official_versions_or_empty(&state, &series_id).await;
+    let rendered = service.render_entry("blog", &slug, entry, versions).await?;
+    cache_official_content(&state, &rendered).await;
+    Ok(Json(rendered))
+}
+
+async fn official_forum_topic(
+    State(state): State<ApiState>,
+    Path(slug): Path<String>,
+) -> ApiResult<OfficialContentResponse> {
+    if let Some(cached) = cached_official_content(&state, "forum", &slug).await {
+        return Ok(Json(cached));
+    }
+    let service = OfficialContentService::new(state.official_content.clone());
+    let manifest = service
+        .load_manifest::<OfficialForumManifest>("forum/manifest.json")
+        .await?;
+    let entry = forum_entry(manifest, &slug).ok_or_else(|| {
+        paperproof_sdk_rs::PaperProofError::invalid_input("official forum slug", "entry not found")
+    })?;
+    let series_id = entry.series_id.clone().ok_or_else(|| {
+        paperproof_sdk_rs::PaperProofError::invalid_input(
+            "seriesId",
+            "official forum entry has no seriesId",
+        )
+    })?;
+    let versions = official_versions_or_empty(&state, &series_id).await;
+    let rendered = service
+        .render_entry("forum", &slug, entry, versions)
+        .await?;
+    cache_official_content(&state, &rendered).await;
+    Ok(Json(rendered))
+}
+
+async fn cached_official_content(
+    state: &ApiState,
+    surface: &str,
+    slug: &str,
+) -> Option<OfficialContentResponse> {
+    state
+        .official_cache
+        .read()
+        .await
+        .get(&official_cache_key(surface, slug))
+        .cloned()
+}
+
+async fn cache_official_content(state: &ApiState, rendered: &OfficialContentResponse) {
+    state.official_cache.write().await.insert(
+        official_cache_key(&rendered.surface, &rendered.slug),
+        rendered.clone(),
+    );
+}
+
+pub async fn refresh_official_content_cache(
+    state: ApiState,
+) -> paperproof_sdk_rs::Result<OfficialContentWarmupReport> {
+    warm_official_content_cache(state).await
+}
+
+fn spawn_official_content_warmup(state: ApiState) {
+    tokio::spawn(async move {
+        match warm_official_content_cache(state).await {
+            Ok(report) => info!(
+                attempted = report.attempted,
+                cached = report.cached,
+                failed = report.failed,
+                "official content cache warmup completed"
+            ),
+            Err(error) => warn!(error = %error, "official content cache warmup failed"),
+        }
+    });
+}
+
+async fn warm_official_content_cache(
+    state: ApiState,
+) -> paperproof_sdk_rs::Result<OfficialContentWarmupReport> {
+    let service = OfficialContentService::new(state.official_content.clone());
+    let mut report = OfficialContentWarmupReport::default();
+    let mut refreshed = HashMap::new();
+    let docs = service
+        .load_manifest::<OfficialDocsManifest>("docs/manifest.json")
+        .await?;
+    for (slug, entry) in docs_entries(docs) {
+        warm_one_official_entry(
+            &state,
+            &service,
+            "docs",
+            &slug,
+            entry,
+            &mut report,
+            &mut refreshed,
+        )
+        .await;
+    }
+    let blog = service
+        .load_manifest::<OfficialBlogManifest>("blog/manifest.json")
+        .await?;
+    for (slug, entry) in blog_entries(blog) {
+        warm_one_official_entry(
+            &state,
+            &service,
+            "blog",
+            &slug,
+            entry,
+            &mut report,
+            &mut refreshed,
+        )
+        .await;
+    }
+    let forum = service
+        .load_manifest::<OfficialForumManifest>("forum/manifest.json")
+        .await?;
+    for (slug, entry) in forum_entries(forum) {
+        warm_one_official_entry(
+            &state,
+            &service,
+            "forum",
+            &slug,
+            entry,
+            &mut report,
+            &mut refreshed,
+        )
+        .await;
+    }
+    replace_official_cache_entries(&state, refreshed).await;
+    Ok(report)
+}
+
+async fn warm_one_official_entry(
+    state: &ApiState,
+    service: &OfficialContentService,
+    surface: &str,
+    slug: &str,
+    entry: crate::official_content::OfficialEntry,
+    report: &mut OfficialContentWarmupReport,
+    refreshed: &mut HashMap<String, OfficialContentResponse>,
+) {
+    report.attempted += 1;
+    let Some(series_id) = entry.series_id.clone() else {
+        report.failed += 1;
+        report
+            .errors
+            .push(format!("{surface}:{slug}: missing seriesId"));
+        return;
+    };
+    let versions = official_versions_or_empty(state, &series_id).await;
+    match service.render_entry(surface, slug, entry, versions).await {
+        Ok(rendered) => {
+            refreshed.insert(official_cache_key(surface, slug), rendered);
+            report.cached += 1;
+        }
+        Err(error) => {
+            report.failed += 1;
+            report.errors.push(format!("{surface}:{slug}: {error}"));
+        }
+    }
+}
+
+async fn replace_official_cache_entries(
+    state: &ApiState,
+    refreshed: HashMap<String, OfficialContentResponse>,
+) {
+    let mut cache = state.official_cache.write().await;
+    cache.retain(|key, _| {
+        !(key.starts_with("docs:") || key.starts_with("blog:") || key.starts_with("forum:"))
+    });
+    cache.extend(refreshed);
+}
+
+async fn official_versions_or_empty(state: &ApiState, series_id: &str) -> Vec<VersionRecord> {
+    match query(state).await {
+        Ok(query) => query.versions(series_id).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 enum ApiQuery {

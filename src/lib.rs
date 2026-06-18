@@ -17,6 +17,7 @@ pub mod config;
 pub mod content;
 pub mod metrics;
 pub mod normalized;
+pub mod official_content;
 pub mod pipeline;
 pub mod schema;
 pub mod store;

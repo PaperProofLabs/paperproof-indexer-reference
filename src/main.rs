@@ -7,9 +7,10 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use paperproof_indexer_reference::{
     ApiConfig, ApiState, ReferenceIndexerConfig, build_cursor_store, build_event_sink,
     content::{PaperProofContentEnricher, default_walrus_content_service},
-    export_airdrop_snapshot, rebuild_normalized_from_postgres_raw,
-    rebuild_normalized_from_sqlite_raw, replay_jsonl_to_state, run_api_server, run_backfill_once,
-    run_tail_once,
+    export_airdrop_snapshot,
+    official_content::OfficialContentConfig,
+    rebuild_normalized_from_postgres_raw, rebuild_normalized_from_sqlite_raw,
+    replay_jsonl_to_state, run_api_server, run_backfill_once, run_tail_once,
     schema::{POSTGRES_REFERENCE_SCHEMA, SQLITE_REFERENCE_SCHEMA},
 };
 use paperproof_sdk_rs::{IndexerTrustPolicy, PaperProofIndexerClient, PaperProofQueryClient};
@@ -213,6 +214,32 @@ struct ServeArgs {
     sqlite_path: String,
     #[arg(long, env = "PAPERPROOF_INDEXER_POSTGRES_URL")]
     postgres_url: Option<String>,
+    #[arg(
+        long,
+        env = "PAPERPROOF_OFFICIAL_MANIFEST_BASE_URL",
+        default_value = "https://paperproof.site"
+    )]
+    official_manifest_base_url: String,
+    #[arg(
+        long,
+        env = "PAPERPROOF_INDEXER_WALRUS_AGGREGATOR",
+        default_value = "https://aggregator.walrus-mainnet.walrus.space"
+    )]
+    walrus_aggregator_url: String,
+    #[arg(long, env = "PAPERPROOF_SERVE_TAIL", default_value_t = true)]
+    tail: bool,
+    #[arg(
+        long,
+        env = "PAPERPROOF_SERVE_TAIL_INTERVAL_MS",
+        default_value_t = 10_000
+    )]
+    tail_interval_ms: u64,
+    #[arg(
+        long,
+        env = "PAPERPROOF_OFFICIAL_REFRESH_INTERVAL_MS",
+        default_value_t = 300_000
+    )]
+    official_refresh_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -377,15 +404,24 @@ async fn main() -> paperproof_sdk_rs::Result<()> {
                     (None, Some(url))
                 }
             };
-            run_api_server(
-                ApiConfig { bind: args.bind },
-                ApiState {
-                    sqlite_path,
-                    postgres_url,
-                    ..Default::default()
+            let api_state = ApiState {
+                sqlite_path: sqlite_path.clone(),
+                postgres_url,
+                official_content: OfficialContentConfig {
+                    manifest_base_url: args.official_manifest_base_url,
+                    walrus_aggregator_url: args.walrus_aggregator_url,
                 },
-            )
-            .await?;
+                ..Default::default()
+            };
+            spawn_official_refresh_loop(api_state.clone(), args.official_refresh_interval_ms);
+            if args.tail {
+                spawn_serve_tail_loop(
+                    sqlite_path.clone(),
+                    args.tail_interval_ms,
+                    api_state.clone(),
+                );
+            }
+            run_api_server(ApiConfig { bind: args.bind }, api_state).await?;
         }
         Commands::Schema { kind } => match kind {
             SchemaKind::Sqlite => println!("{SQLITE_REFERENCE_SCHEMA}"),
@@ -556,4 +592,63 @@ fn init_tracing() {
             "paperproof_indexer_reference=info,paperproof_sdk_rs=info".to_string()
         }))
         .try_init();
+}
+
+fn spawn_serve_tail_loop(sqlite_path: Option<String>, interval_ms: u64, api_state: ApiState) {
+    let Some(sqlite_path) = sqlite_path else {
+        tracing::warn!("serve tail loop is only enabled for sqlite backend");
+        return;
+    };
+    tokio::spawn(async move {
+        let output_dir = std::path::Path::new(&sqlite_path)
+            .parent()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "artifacts/indexer-mainnet".to_string());
+        let config = ReferenceIndexerConfig {
+            sink: "sqlite".to_string(),
+            output_dir,
+            page_limit: 50,
+            trust_policy: IndexerTrustPolicy::Canonical,
+            fail_on_rejected: true,
+            tail_interval_ms: interval_ms,
+            ..Default::default()
+        };
+        loop {
+            match tail_once(&config).await {
+                Ok(report) => {
+                    if report.accepted_written > 0 {
+                        tracing::info!(
+                            accepted = report.accepted_written,
+                            duplicates = report.duplicate_skipped,
+                            "serve tail loop indexed events"
+                        );
+                        refresh_official_cache_after_tail(api_state.clone()).await;
+                    }
+                }
+                Err(error) => tracing::warn!(error = %error, "serve tail loop failed"),
+            }
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        }
+    });
+}
+
+fn spawn_official_refresh_loop(api_state: ApiState, interval_ms: u64) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            refresh_official_cache_after_tail(api_state.clone()).await;
+        }
+    });
+}
+
+async fn refresh_official_cache_after_tail(api_state: ApiState) {
+    match paperproof_indexer_reference::api::refresh_official_content_cache(api_state).await {
+        Ok(report) => tracing::info!(
+            attempted = report.attempted,
+            cached = report.cached,
+            failed = report.failed,
+            "official content cache refreshed"
+        ),
+        Err(error) => tracing::warn!(error = %error, "official content cache refresh failed"),
+    }
 }
