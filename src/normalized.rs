@@ -222,6 +222,48 @@ impl NormalizedQuery {
             .map_err(sqlite_err("read artifact detail"))
     }
 
+    pub fn lookup_artifact(&self, term: &str) -> paperproof_sdk_rs::Result<Option<ArtifactRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare("select series_id, artifact_code, artifact_type, owner, latest_version_id, comments_tree_id, likes_book_id, title, status, published_at, updated_at, raw_json from domain_artifacts where lower(series_id) = lower(?1) or lower(artifact_code) = lower(?1) limit 1")
+            .map_err(sqlite_err("prepare artifact lookup"))?;
+        let mut rows = stmt
+            .query_map([term], artifact_from_row)
+            .map_err(sqlite_err("query artifact lookup"))?;
+        rows.next()
+            .transpose()
+            .map_err(sqlite_err("read artifact lookup"))
+    }
+
+    pub fn count_artifacts(&self, artifact_type: Option<u64>) -> paperproof_sdk_rs::Result<u64> {
+        let conn = self.connection()?;
+        let count = if let Some(kind) = artifact_type {
+            let mut stmt = conn
+                .prepare("select count(*) from domain_artifacts where artifact_type = ?1")
+                .map_err(sqlite_err("prepare artifact count"))?;
+            stmt.query_row([u64_to_i64(kind)?], |row| row.get::<_, i64>(0))
+                .map_err(sqlite_err("query artifact count"))?
+        } else {
+            scalar_i64(&conn, "select count(*) from domain_artifacts")?
+        };
+        u64::try_from(count).map_err(|err| {
+            paperproof_sdk_rs::PaperProofError::invalid_input("artifact count", err.to_string())
+        })
+    }
+
+    pub fn count_comments(&self, series_id: &str) -> paperproof_sdk_rs::Result<u64> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare("select count(*) from domain_comments where series_id = ?1")
+            .map_err(sqlite_err("prepare comment count"))?;
+        let count = stmt
+            .query_row([series_id], |row| row.get::<_, i64>(0))
+            .map_err(sqlite_err("query comment count"))?;
+        u64::try_from(count).map_err(|err| {
+            paperproof_sdk_rs::PaperProofError::invalid_input("comment count", err.to_string())
+        })
+    }
+
     pub fn versions(&self, series_id: &str) -> paperproof_sdk_rs::Result<Vec<VersionRecord>> {
         let conn = self.connection()?;
         let mut stmt = conn
@@ -507,6 +549,54 @@ impl PostgresNormalizedQuery {
         row.as_ref().map(pg_artifact_from_row).transpose()
     }
 
+    pub async fn lookup_artifact(
+        &self,
+        term: &str,
+    ) -> paperproof_sdk_rs::Result<Option<ArtifactRecord>> {
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                "select series_id, artifact_code, artifact_type, owner, latest_version_id,
+                        comments_tree_id, likes_book_id, title, status,
+                        published_at::text, updated_at::text, raw_json
+                 from domain_artifacts
+                 where lower(series_id) = lower($1) or lower(artifact_code) = lower($1)
+                 limit 1",
+                &[&term],
+            )
+            .await
+            .map_err(postgres_err("postgres artifact lookup"))?;
+        row.as_ref().map(pg_artifact_from_row).transpose()
+    }
+
+    pub async fn count_artifacts(
+        &self,
+        artifact_type: Option<u64>,
+    ) -> paperproof_sdk_rs::Result<u64> {
+        let client = self.client.lock().await;
+        let kind = opt_u64_to_i64_pg(artifact_type)?;
+        let row = client
+            .query_one(
+                "select count(*) from domain_artifacts where ($1::bigint is null or artifact_type = $1)",
+                &[&kind],
+            )
+            .await
+            .map_err(postgres_err("postgres artifact count"))?;
+        i64_to_u64_pg(row.get(0))
+    }
+
+    pub async fn count_comments(&self, series_id: &str) -> paperproof_sdk_rs::Result<u64> {
+        let client = self.client.lock().await;
+        let row = client
+            .query_one(
+                "select count(*) from domain_comments where series_id = $1",
+                &[&series_id],
+            )
+            .await
+            .map_err(postgres_err("postgres comment count"))?;
+        i64_to_u64_pg(row.get(0))
+    }
+
     pub async fn versions(&self, series_id: &str) -> paperproof_sdk_rs::Result<Vec<VersionRecord>> {
         let client = self.client.lock().await;
         let rows = client
@@ -725,6 +815,21 @@ impl NormalizedQuery {
         &self,
         _series_id: &str,
     ) -> paperproof_sdk_rs::Result<Option<ArtifactRecord>> {
+        Err(sqlite_required())
+    }
+
+    pub fn lookup_artifact(
+        &self,
+        _term: &str,
+    ) -> paperproof_sdk_rs::Result<Option<ArtifactRecord>> {
+        Err(sqlite_required())
+    }
+
+    pub fn count_artifacts(&self, _artifact_type: Option<u64>) -> paperproof_sdk_rs::Result<u64> {
+        Err(sqlite_required())
+    }
+
+    pub fn count_comments(&self, _series_id: &str) -> paperproof_sdk_rs::Result<u64> {
         Err(sqlite_required())
     }
 

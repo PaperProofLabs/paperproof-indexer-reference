@@ -642,7 +642,8 @@ fn spawn_official_refresh_loop(api_state: ApiState, interval_ms: u64) {
 }
 
 async fn refresh_official_cache_after_tail(api_state: ApiState) {
-    match paperproof_indexer_reference::api::refresh_official_content_cache(api_state).await {
+    match paperproof_indexer_reference::api::refresh_official_content_cache(api_state.clone()).await
+    {
         Ok(report) => tracing::info!(
             attempted = report.attempted,
             cached = report.cached,
@@ -650,5 +651,9 @@ async fn refresh_official_cache_after_tail(api_state: ApiState) {
             "official content cache refreshed"
         ),
         Err(error) => tracing::warn!(error = %error, "official content cache refresh failed"),
+    }
+    match paperproof_indexer_reference::api::refresh_explore_content_cache(api_state).await {
+        Ok(entries) => tracing::info!(entries, "explore content cache refreshed"),
+        Err(error) => tracing::warn!(error = %error, "explore content cache refresh failed"),
     }
 }

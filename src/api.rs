@@ -11,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -29,6 +30,7 @@ use crate::official_content::{
     OfficialForumManifest, blog_entries, blog_entry, docs_entries, docs_entry, forum_entries,
     forum_entry, official_cache_key,
 };
+use paperproof_sdk_rs::PaperProofQueryClient;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApiConfig {
@@ -50,6 +52,7 @@ pub struct ApiState {
     pub postgres_url: Option<String>,
     pub official_content: OfficialContentConfig,
     pub official_cache: OfficialContentCache,
+    pub explore_cache: ExploreContentCache,
 }
 
 impl Default for ApiState {
@@ -60,8 +63,22 @@ impl Default for ApiState {
             postgres_url: None,
             official_content: OfficialContentConfig::default(),
             official_cache: Arc::new(RwLock::new(HashMap::new())),
+            explore_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+}
+
+pub type ExploreContentCache = Arc<RwLock<HashMap<String, ExploreCacheEntry>>>;
+
+#[derive(Clone, Debug)]
+pub struct ExploreCacheEntry {
+    pub value: ExploreCacheValue,
+}
+
+#[derive(Clone, Debug)]
+pub enum ExploreCacheValue {
+    Summary(ExploreSummaryResponse),
+    Items(ExploreItemsResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -75,6 +92,7 @@ pub struct PageParams {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub artifact_type: Option<u64>,
+    pub sort: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -110,6 +128,74 @@ pub struct ArtifactDetailResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreSummaryResponse {
+    pub refreshed_at: String,
+    pub per_type: u64,
+    pub types: Vec<ExploreTypeSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreTypeSummary {
+    pub artifact_type: u64,
+    pub slug: String,
+    pub total_indexed: u64,
+    pub items: Vec<ExploreArtifactItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreItemsResponse {
+    pub refreshed_at: String,
+    pub artifact_type: Option<u64>,
+    pub sort: String,
+    pub limit: u64,
+    pub offset: u64,
+    pub has_more: bool,
+    pub items: Vec<ExploreArtifactItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreLookupResponse {
+    pub refreshed_at: String,
+    pub artifact: Option<ExploreArtifactItem>,
+    pub versions: Vec<VersionRecord>,
+    pub comments: Vec<CommentRecord>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreArtifactItem {
+    pub series_id: String,
+    pub artifact_code: String,
+    pub artifact_type: u64,
+    pub type_slug: String,
+    pub title: String,
+    pub summary: String,
+    pub owner: String,
+    pub authors: Vec<String>,
+    pub status: String,
+    pub published_at: String,
+    pub updated_at: String,
+    pub latest_version_id: String,
+    pub latest_version_number: u64,
+    pub comments_tree_id: String,
+    pub likes_book_id: String,
+    pub comment_count: Option<u64>,
+    pub like_count: Option<u64>,
+    pub content_hash: String,
+    pub walrus_blob_id: String,
+    pub content_type: String,
+    pub license: String,
+    pub field: String,
+    pub keywords: Vec<String>,
+    pub raw_artifact: serde_json::Value,
+    pub raw_version: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ApiErrorResponse {
     pub error: String,
 }
@@ -139,14 +225,19 @@ impl IntoResponse for ApiError {
 
 pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sdk_rs::Result<()> {
     spawn_official_content_warmup(state.clone());
+    spawn_explore_content_warmup(state.clone());
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/analytics/summary", get(analytics))
         .route("/v1/analytics/airdrop-snapshot-plan", get(snapshot_plan))
         .route("/metrics", get(metrics))
         .route("/metrics/prometheus", get(prometheus_metrics))
+        .route("/v1/explore/summary", get(explore_summary))
         .route("/v1/explore/artifacts", get(explore_artifacts))
+        .route("/v1/explore/items", get(explore_items))
+        .route("/v1/explore/search", get(explore_search_artifacts))
         .route("/v1/search/artifacts", get(search_artifacts))
+        .route("/v1/artifacts/lookup", get(artifact_lookup))
         .route("/v1/artifacts/{series_id}", get(artifact_detail))
         .route("/v1/artifacts/{series_id}/versions", get(artifact_versions))
         .route("/v1/artifacts/{series_id}/comments", get(artifact_comments))
@@ -231,6 +322,80 @@ async fn explore_artifacts(
     ))
 }
 
+async fn explore_items(
+    State(state): State<ApiState>,
+    Query(params): Query<PageParams>,
+) -> ApiResult<ExploreItemsResponse> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).min(2_000);
+    let sort = normalize_explore_sort(params.sort.as_deref());
+    let cache_key = format!(
+        "explore:list:{}:{sort}:{limit}:{offset}",
+        params
+            .artifact_type
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "all".to_string())
+    );
+    if let Some(ExploreCacheValue::Items(cached)) = cached_explore_value(&state, &cache_key).await {
+        return Ok(Json(cached));
+    }
+    let rendered = build_explore_items(&state, params.artifact_type, &sort, limit, offset).await?;
+    cache_explore_value(
+        &state,
+        cache_key,
+        ExploreCacheValue::Items(rendered.clone()),
+    )
+    .await;
+    Ok(Json(rendered))
+}
+
+async fn explore_summary(
+    State(state): State<ApiState>,
+    Query(params): Query<PageParams>,
+) -> ApiResult<ExploreSummaryResponse> {
+    let per_type = params.limit.unwrap_or(5).clamp(4, 20);
+    let cache_key = format!("explore:summary:{per_type}");
+    if let Some(ExploreCacheValue::Summary(cached)) = cached_explore_value(&state, &cache_key).await
+    {
+        return Ok(Json(cached));
+    }
+    let query = query(&state).await?;
+    let mut types = Vec::new();
+    for artifact_type in 1..=6 {
+        let items = explore_items_from_records(
+            &query,
+            query
+                .recent_artifacts(Some(artifact_type), per_type, 0)
+                .await?,
+        )
+        .await?;
+        let total_indexed = query
+            .count_artifacts(Some(artifact_type))
+            .await
+            .unwrap_or(0);
+        types.push(ExploreTypeSummary {
+            artifact_type,
+            slug: artifact_type_slug(artifact_type)
+                .unwrap_or("unknown")
+                .to_string(),
+            total_indexed,
+            items,
+        });
+    }
+    let rendered = ExploreSummaryResponse {
+        refreshed_at: now_rfc3339(),
+        per_type,
+        types,
+    };
+    cache_explore_value(
+        &state,
+        cache_key,
+        ExploreCacheValue::Summary(rendered.clone()),
+    )
+    .await;
+    Ok(Json(rendered))
+}
+
 async fn search_artifacts(
     State(state): State<ApiState>,
     Query(params): Query<SearchParams>,
@@ -247,6 +412,63 @@ async fn search_artifacts(
             )
             .await?,
     ))
+}
+
+async fn explore_search_artifacts(
+    State(state): State<ApiState>,
+    Query(params): Query<SearchParams>,
+) -> ApiResult<ExploreItemsResponse> {
+    let limit = params.limit.unwrap_or(25).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0).min(2_000);
+    let query = query(&state).await?;
+    let records = query
+        .search_artifacts(
+            &params.q,
+            params.artifact_type,
+            params.owner.as_deref(),
+            limit + 1,
+            offset,
+        )
+        .await?;
+    let has_more = records.len() as u64 > limit;
+    let items =
+        explore_items_from_records(&query, records.into_iter().take(limit as usize).collect())
+            .await?;
+    Ok(Json(ExploreItemsResponse {
+        refreshed_at: now_rfc3339(),
+        artifact_type: params.artifact_type,
+        sort: "search".to_string(),
+        limit,
+        offset,
+        has_more,
+        items,
+    }))
+}
+
+async fn artifact_lookup(
+    State(state): State<ApiState>,
+    Query(params): Query<SearchParams>,
+) -> ApiResult<ExploreLookupResponse> {
+    let term = params.q.trim();
+    let query = query(&state).await?;
+    let artifact = query.lookup_artifact(term).await?;
+    let Some(artifact) = artifact else {
+        return Ok(Json(ExploreLookupResponse {
+            refreshed_at: now_rfc3339(),
+            artifact: None,
+            versions: Vec::new(),
+            comments: Vec::new(),
+        }));
+    };
+    let versions = query.versions(&artifact.series_id).await?;
+    let comments = query.comments(&artifact.series_id, 100, 0).await?;
+    let item = explore_item_from_record(&query, artifact, versions.clone()).await?;
+    Ok(Json(ExploreLookupResponse {
+        refreshed_at: now_rfc3339(),
+        artifact: Some(item),
+        versions,
+        comments,
+    }))
 }
 
 async fn artifact_detail(
@@ -498,6 +720,15 @@ fn spawn_official_content_warmup(state: ApiState) {
     });
 }
 
+fn spawn_explore_content_warmup(state: ApiState) {
+    tokio::spawn(async move {
+        match refresh_explore_content_cache(state).await {
+            Ok(count) => info!(entries = count, "explore content cache warmup completed"),
+            Err(error) => warn!(error = %error, "explore content cache warmup failed"),
+        }
+    });
+}
+
 async fn warm_official_content_cache(
     state: ApiState,
 ) -> paperproof_sdk_rs::Result<OfficialContentWarmupReport> {
@@ -601,6 +832,403 @@ async fn official_versions_or_empty(state: &ApiState, series_id: &str) -> Vec<Ve
     }
 }
 
+async fn cached_explore_value(state: &ApiState, key: &str) -> Option<ExploreCacheValue> {
+    state
+        .explore_cache
+        .read()
+        .await
+        .get(key)
+        .map(|entry| entry.value.clone())
+}
+
+async fn cache_explore_value(state: &ApiState, key: String, value: ExploreCacheValue) {
+    state
+        .explore_cache
+        .write()
+        .await
+        .insert(key, ExploreCacheEntry { value });
+}
+
+pub async fn refresh_explore_content_cache(state: ApiState) -> paperproof_sdk_rs::Result<usize> {
+    let mut next = HashMap::new();
+    let query = query(&state).await?;
+    let per_type = 5;
+    let mut types = Vec::new();
+    for artifact_type in 1..=6 {
+        let items = explore_items_from_records(
+            &query,
+            query
+                .recent_artifacts(Some(artifact_type), per_type, 0)
+                .await?,
+        )
+        .await?;
+        let total_indexed = query
+            .count_artifacts(Some(artifact_type))
+            .await
+            .unwrap_or(0);
+        types.push(ExploreTypeSummary {
+            artifact_type,
+            slug: artifact_type_slug(artifact_type)
+                .unwrap_or("unknown")
+                .to_string(),
+            total_indexed,
+            items,
+        });
+    }
+    next.insert(
+        "explore:summary:5".to_string(),
+        ExploreCacheEntry {
+            value: ExploreCacheValue::Summary(ExploreSummaryResponse {
+                refreshed_at: now_rfc3339(),
+                per_type,
+                types,
+            }),
+        },
+    );
+    for artifact_type in 1..=6 {
+        let rendered = build_explore_items(&state, Some(artifact_type), "newest", 50, 0).await?;
+        next.insert(
+            format!("explore:list:{artifact_type}:newest:50:0"),
+            ExploreCacheEntry {
+                value: ExploreCacheValue::Items(rendered),
+            },
+        );
+    }
+    let count = next.len();
+    *state.explore_cache.write().await = next;
+    Ok(count)
+}
+
+async fn build_explore_items(
+    state: &ApiState,
+    artifact_type: Option<u64>,
+    sort: &str,
+    limit: u64,
+    offset: u64,
+) -> paperproof_sdk_rs::Result<ExploreItemsResponse> {
+    let query = query(state).await?;
+    let records = query
+        .recent_artifacts(artifact_type, limit + 1, offset)
+        .await?;
+    let has_more = records.len() as u64 > limit && offset + limit < 2_000;
+    let mut items =
+        explore_items_from_records(&query, records.into_iter().take(limit as usize).collect())
+            .await?;
+    if sort == "discussed" {
+        items.sort_by(|left, right| {
+            right
+                .comment_count
+                .unwrap_or(0)
+                .cmp(&left.comment_count.unwrap_or(0))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+    } else if sort == "updated" || sort == "liked" {
+        items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    } else {
+        items.sort_by(|left, right| right.published_at.cmp(&left.published_at));
+    }
+    Ok(ExploreItemsResponse {
+        refreshed_at: now_rfc3339(),
+        artifact_type,
+        sort: sort.to_string(),
+        limit,
+        offset,
+        has_more,
+        items,
+    })
+}
+
+async fn explore_items_from_records(
+    query: &ApiQuery,
+    records: Vec<ArtifactRecord>,
+) -> paperproof_sdk_rs::Result<Vec<ExploreArtifactItem>> {
+    let mut items = Vec::with_capacity(records.len());
+    for record in records {
+        let versions = query.versions(&record.series_id).await.unwrap_or_default();
+        items.push(explore_item_from_record(query, record, versions).await?);
+    }
+    Ok(items)
+}
+
+async fn explore_item_from_record(
+    query: &ApiQuery,
+    record: ArtifactRecord,
+    versions: Vec<VersionRecord>,
+) -> paperproof_sdk_rs::Result<ExploreArtifactItem> {
+    let artifact_type = record.artifact_type.unwrap_or(0);
+    let mut latest_version = choose_latest_version_for_explore(&record, &versions);
+    if let Some(version) = latest_version.as_mut() {
+        hydrate_explore_version(version).await;
+    }
+    let raw_version = latest_version
+        .as_ref()
+        .map(|version| version.raw_json.clone());
+    let raw = latest_version
+        .as_ref()
+        .map(|version| version.raw_json.clone())
+        .unwrap_or_else(|| record.raw_json.clone());
+    let comment_count = query.count_comments(&record.series_id).await.ok();
+    Ok(ExploreArtifactItem {
+        series_id: record.series_id.clone(),
+        artifact_code: record
+            .artifact_code
+            .clone()
+            .unwrap_or_else(|| format!("Artifact {}", record.series_id)),
+        artifact_type,
+        type_slug: artifact_type_slug(artifact_type)
+            .unwrap_or("generic-files")
+            .to_string(),
+        title: title_from_explore_raw(artifact_type, &raw, record.artifact_code.as_deref()),
+        summary: summary_from_explore_raw(artifact_type, &raw),
+        owner: record.owner.clone().unwrap_or_default(),
+        authors: authors_from_explore_raw(artifact_type, &raw, record.owner.as_deref()),
+        status: if record.status.unwrap_or(0) == 0 {
+            "Active".to_string()
+        } else {
+            "Paused".to_string()
+        },
+        published_at: date_from_timestamp_string(record.published_at.as_deref()),
+        updated_at: date_from_timestamp_string(record.updated_at.as_deref()),
+        latest_version_id: record
+            .latest_version_id
+            .clone()
+            .or_else(|| {
+                latest_version
+                    .as_ref()
+                    .map(|version| version.version_id.clone())
+            })
+            .unwrap_or_default(),
+        latest_version_number: latest_version
+            .as_ref()
+            .and_then(|version| version.version)
+            .unwrap_or(1),
+        comments_tree_id: record.comments_tree_id.clone().unwrap_or_default(),
+        likes_book_id: record.likes_book_id.clone().unwrap_or_default(),
+        comment_count,
+        like_count: None,
+        content_hash: latest_version
+            .as_ref()
+            .and_then(|version| version.content_hash.clone())
+            .unwrap_or_else(|| "Not stored".to_string()),
+        walrus_blob_id: latest_version
+            .as_ref()
+            .and_then(|version| version.walrus_blob_id.clone())
+            .unwrap_or_else(|| "Not loaded".to_string()),
+        content_type: latest_version
+            .as_ref()
+            .and_then(|version| version.content_type.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        license: string_field(&raw, "license").unwrap_or_else(|| "Not specified".to_string()),
+        field: field_from_explore_raw(artifact_type, &raw),
+        keywords: if artifact_type == 2 {
+            string_list_field(&raw, "tags")
+        } else {
+            string_list_field(&raw, "keywords")
+        },
+        raw_artifact: record.raw_json,
+        raw_version,
+    })
+}
+
+async fn hydrate_explore_version(version: &mut VersionRecord) {
+    if explore_raw_has_display_fields(&version.raw_json) {
+        return;
+    }
+    let Ok(view) = PaperProofQueryClient::mainnet()
+        .read
+        .get_version_view(&version.version_id)
+        .await
+    else {
+        return;
+    };
+    version.raw_json = view.raw_fields.clone();
+    version.artifact_type = version.artifact_type.or(view.artifact_type.map(u64::from));
+    version.version = version.version.or(view.version);
+    version.content_hash = version.content_hash.clone().or(view.content_hash);
+    version.walrus_blob_id = version
+        .walrus_blob_id
+        .clone()
+        .or_else(|| json_string_path(&version.raw_json, &["header", "fields", "walrus_blob_id"]));
+    version.content_type = version
+        .content_type
+        .clone()
+        .or_else(|| json_string_path(&version.raw_json, &["header", "fields", "content_type"]));
+}
+
+fn explore_raw_has_display_fields(value: &serde_json::Value) -> bool {
+    [
+        "title",
+        "abstract_text",
+        "summary",
+        "description",
+        "changelog",
+        "project_name",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some())
+}
+
+fn choose_latest_version_for_explore(
+    record: &ArtifactRecord,
+    versions: &[VersionRecord],
+) -> Option<VersionRecord> {
+    if let Some(latest_id) = &record.latest_version_id {
+        if let Some(version) = versions
+            .iter()
+            .find(|version| &version.version_id == latest_id)
+        {
+            return Some(version.clone());
+        }
+    }
+    versions
+        .iter()
+        .max_by_key(|version| version.version.unwrap_or(0))
+        .cloned()
+}
+
+fn normalize_explore_sort(value: Option<&str>) -> String {
+    match value {
+        Some("updated") => "updated".to_string(),
+        Some("discussed") => "discussed".to_string(),
+        Some("liked") => "liked".to_string(),
+        _ => "newest".to_string(),
+    }
+}
+
+fn artifact_type_slug(value: u64) -> Option<&'static str> {
+    match value {
+        1 => Some("preprints"),
+        2 => Some("blog-posts"),
+        3 => Some("technical-reports"),
+        4 => Some("datasets"),
+        5 => Some("software-releases"),
+        6 => Some("generic-files"),
+        _ => None,
+    }
+}
+
+fn title_from_explore_raw(
+    artifact_type: u64,
+    raw: &serde_json::Value,
+    fallback: Option<&str>,
+) -> String {
+    if artifact_type == 5 {
+        return string_field(raw, "project_name")
+            .unwrap_or_else(|| fallback.unwrap_or("Artifact").to_string());
+    }
+    string_field(raw, "title").unwrap_or_else(|| fallback.unwrap_or("Artifact").to_string())
+}
+
+fn summary_from_explore_raw(artifact_type: u64, raw: &serde_json::Value) -> String {
+    match artifact_type {
+        1 | 3 => string_field(raw, "abstract_text")
+            .unwrap_or_else(|| "No abstract stored on the latest readable version.".to_string()),
+        2 => string_field(raw, "summary")
+            .unwrap_or_else(|| "No summary stored on the latest readable version.".to_string()),
+        5 => string_field(raw, "changelog")
+            .unwrap_or_else(|| "No changelog stored on the latest readable version.".to_string()),
+        _ => string_field(raw, "description")
+            .unwrap_or_else(|| "No description stored on the latest readable version.".to_string()),
+    }
+}
+
+fn authors_from_explore_raw(
+    artifact_type: u64,
+    raw: &serde_json::Value,
+    owner: Option<&str>,
+) -> Vec<String> {
+    if artifact_type == 2 {
+        if let Some(author) = string_field(raw, "author_name") {
+            return vec![author];
+        }
+    }
+    let authors = string_list_field(raw, "authors");
+    if !authors.is_empty() {
+        return authors;
+    }
+    owner
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn field_from_explore_raw(artifact_type: u64, raw: &serde_json::Value) -> String {
+    match artifact_type {
+        5 => string_field(raw, "repository_url").unwrap_or_else(|| "Software".to_string()),
+        6 => string_field(raw, "filename").unwrap_or_else(|| "File".to_string()),
+        4 => string_field(raw, "format").unwrap_or_else(|| "Dataset".to_string()),
+        _ => string_field(raw, "field")
+            .or_else(|| string_field(raw, "organization"))
+            .unwrap_or_else(|| "Artifact".to_string()),
+    }
+}
+
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(value_to_string)
+        .filter(|v| !v.is_empty())
+}
+
+fn string_list_field(value: &serde_json::Value, key: &str) -> Vec<String> {
+    let Some(item) = value.get(key) else {
+        return Vec::new();
+    };
+    if let Some(values) = item.as_array() {
+        return values.iter().filter_map(value_to_string).collect();
+    }
+    value_to_string(item)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn value_to_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        return Some(value.trim().to_string());
+    }
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.trim().to_string())
+}
+
+fn json_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = cursor.get(*segment)?;
+    }
+    value_to_string(cursor)
+}
+
+fn date_from_timestamp_string(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "On-chain".to_string();
+    };
+    if value.contains('T') {
+        return value.chars().take(10).collect();
+    }
+    if let Ok(ms) = value.parse::<u64>() {
+        if ms > 0 {
+            let days = ms / 86_400_000;
+            return format!("epoch+{days}d");
+        }
+    }
+    value.chars().take(10).collect()
+}
+
+fn now_rfc3339() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("unix:{seconds}")
+}
+
 enum ApiQuery {
     #[cfg(feature = "sqlite")]
     Sqlite(NormalizedQuery),
@@ -674,6 +1302,42 @@ impl ApiQuery {
             Self::Sqlite(query) => query.artifact_detail(series_id),
             #[cfg(feature = "postgres")]
             Self::Postgres(query) => query.artifact_detail(series_id).await,
+            Self::Unavailable => Err(api_backend_required()),
+        }
+    }
+
+    async fn lookup_artifact(
+        &self,
+        term: &str,
+    ) -> paperproof_sdk_rs::Result<Option<ArtifactRecord>> {
+        let _ = term;
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(query) => query.lookup_artifact(term),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(query) => query.lookup_artifact(term).await,
+            Self::Unavailable => Err(api_backend_required()),
+        }
+    }
+
+    async fn count_artifacts(&self, artifact_type: Option<u64>) -> paperproof_sdk_rs::Result<u64> {
+        let _ = artifact_type;
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(query) => query.count_artifacts(artifact_type),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(query) => query.count_artifacts(artifact_type).await,
+            Self::Unavailable => Err(api_backend_required()),
+        }
+    }
+
+    async fn count_comments(&self, series_id: &str) -> paperproof_sdk_rs::Result<u64> {
+        let _ = series_id;
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(query) => query.count_comments(series_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(query) => query.count_comments(series_id).await,
             Self::Unavailable => Err(api_backend_required()),
         }
     }
