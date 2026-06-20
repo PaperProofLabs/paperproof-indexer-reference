@@ -253,6 +253,10 @@ pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sd
         )
         .route("/v1/official/blog/{slug}", get(official_blog_post))
         .route("/v1/official/forum/{slug}", get(official_forum_topic))
+        .route(
+            "/v1/official-assets/{surface}/{*asset_path}",
+            get(official_content_asset),
+        )
         .with_state(state);
     let listener = TcpListener::bind(&config.bind).await.map_err(|err| {
         paperproof_sdk_rs::PaperProofError::network(&config.bind, err.to_string())
@@ -680,6 +684,49 @@ async fn official_forum_topic(
     Ok(Json(rendered))
 }
 
+async fn official_content_asset(
+    State(state): State<ApiState>,
+    Path((surface, asset_path)): Path<(String, String)>,
+) -> Response {
+    let mut parts = asset_path.split('/').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(asset_index) = parts.iter().position(|part| *part == "assets") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if asset_index == 0 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let slug = parts[..asset_index].join("/");
+    let asset_path = parts.split_off(asset_index).join("/");
+    if !safe_official_asset_path(&asset_path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let cached = {
+        state
+            .official_cache
+            .read()
+            .await
+            .get(&official_cache_key(&surface, &slug))
+            .cloned()
+    };
+    let Some(cached) = cached else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(asset) = cached.assets.get(&asset_path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, asset.content_type.as_str()),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        asset.bytes.clone(),
+    )
+        .into_response()
+}
+
 async fn cached_official_content(
     state: &ApiState,
     surface: &str,
@@ -823,6 +870,14 @@ async fn replace_official_cache_entries(
         !(key.starts_with("docs:") || key.starts_with("blog:") || key.starts_with("forum:"))
     });
     cache.extend(refreshed);
+}
+
+fn safe_official_asset_path(path: &str) -> bool {
+    path.starts_with("assets/")
+        && !path.starts_with('/')
+        && !path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
 }
 
 async fn official_versions_or_empty(state: &ApiState, series_id: &str) -> Vec<VersionRecord> {

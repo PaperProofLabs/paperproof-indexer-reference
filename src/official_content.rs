@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,10 +32,20 @@ pub struct OfficialContentResponse {
     pub render_status: String,
     pub source_kind: String,
     pub has_local_asset_refs: bool,
+    #[serde(default)]
+    pub asset_paths: Vec<String>,
+    #[serde(skip)]
+    pub assets: HashMap<String, OfficialContentAsset>,
     pub manifest_entry: Value,
 }
 
 pub type OfficialContentCache = Arc<RwLock<HashMap<String, OfficialContentResponse>>>;
+
+#[derive(Clone, Debug)]
+pub struct OfficialContentAsset {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OfficialContentWarmupReport {
@@ -230,16 +240,23 @@ impl OfficialContentService {
                 ));
             }
         }
-        let raw_markdown = markdown_from_package_or_text(&bytes)?;
+        let package = markdown_from_package_or_text(&bytes)?;
         let markdown = if surface == "blog" || surface == "forum" {
             clean_blog_markdown_for_display(
-                &raw_markdown,
+                &package.markdown,
                 entry.title.as_deref().unwrap_or_default(),
             )
         } else {
-            raw_markdown
+            package.markdown
         };
         let has_local_asset_refs = markdown_has_local_asset_refs(&markdown);
+        let markdown = rewrite_markdown_local_asset_refs(
+            &markdown,
+            surface,
+            slug,
+            package.assets.keys().map(String::as_str).collect(),
+        );
+        let asset_paths = package.assets.keys().cloned().collect();
         Ok(OfficialContentResponse {
             surface: surface.to_string(),
             slug: slug.to_string(),
@@ -258,6 +275,8 @@ impl OfficialContentService {
             render_status: "markdown".to_string(),
             source_kind,
             has_local_asset_refs,
+            asset_paths,
+            assets: package.assets,
             manifest_entry: entry.manifest_entry,
         })
     }
@@ -509,19 +528,29 @@ fn normalize_hash(value: &str) -> String {
     value.strip_prefix("sha256:").unwrap_or(value).to_string()
 }
 
-fn markdown_from_package_or_text(bytes: &[u8]) -> paperproof_sdk_rs::Result<String> {
+struct MarkdownPackage {
+    markdown: String,
+    assets: HashMap<String, OfficialContentAsset>,
+}
+
+fn markdown_from_package_or_text(bytes: &[u8]) -> paperproof_sdk_rs::Result<MarkdownPackage> {
     if !is_zip_bytes(bytes) {
-        return String::from_utf8(bytes.to_vec()).map_err(|err| {
+        let markdown = String::from_utf8(bytes.to_vec()).map_err(|err| {
             paperproof_sdk_rs::PaperProofError::invalid_input(
                 "official content utf8",
                 err.to_string(),
             )
+        })?;
+        return Ok(MarkdownPackage {
+            markdown,
+            assets: HashMap::new(),
         });
     }
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|err| {
         paperproof_sdk_rs::PaperProofError::invalid_input("markdown package", err.to_string())
     })?;
+    let manifest = package_manifest(&mut archive);
     let entry = package_entry_name(&mut archive).unwrap_or_else(|| "index.md".to_string());
     let selected_entry = if archive.by_name(&entry).is_ok() {
         entry
@@ -535,20 +564,49 @@ fn markdown_from_package_or_text(bytes: &[u8]) -> paperproof_sdk_rs::Result<Stri
     file.read_to_string(&mut markdown).map_err(|err| {
         paperproof_sdk_rs::PaperProofError::invalid_input("markdown package utf8", err.to_string())
     })?;
-    Ok(markdown)
+    drop(file);
+    let mut asset_paths = manifest_asset_paths(manifest.as_ref());
+    asset_paths.extend(extract_markdown_asset_paths(&markdown));
+    let mut assets = HashMap::new();
+    for asset_path in asset_paths {
+        if !is_safe_package_asset_path(&asset_path) {
+            continue;
+        }
+        if let Ok(mut asset_file) = archive.by_name(&asset_path) {
+            let mut bytes = Vec::new();
+            asset_file.read_to_end(&mut bytes).map_err(|err| {
+                paperproof_sdk_rs::PaperProofError::invalid_input(
+                    "markdown package asset",
+                    err.to_string(),
+                )
+            })?;
+            assets.insert(
+                asset_path.clone(),
+                OfficialContentAsset {
+                    content_type: content_type_for_asset(&asset_path, manifest.as_ref()),
+                    bytes,
+                },
+            );
+        }
+    }
+    Ok(MarkdownPackage { markdown, assets })
 }
 
 fn package_entry_name<R: Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> Option<String> {
-    let mut manifest_file = archive.by_name("manifest.json").ok()?;
-    let mut manifest = String::new();
-    manifest_file.read_to_string(&mut manifest).ok()?;
-    let value: Value = serde_json::from_str(&manifest).ok()?;
+    let value = package_manifest(archive)?;
     value
         .get("entry")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn package_manifest<R: Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> Option<Value> {
+    let mut manifest_file = archive.by_name("manifest.json").ok()?;
+    let mut manifest = String::new();
+    manifest_file.read_to_string(&mut manifest).ok()?;
+    serde_json::from_str(&manifest).ok()
 }
 
 fn is_zip_bytes(bytes: &[u8]) -> bool {
@@ -604,4 +662,172 @@ fn markdown_has_local_asset_refs(markdown: &str) -> bool {
             && !target.starts_with('#')
             && !target.starts_with('/')
     })
+}
+
+fn manifest_asset_paths(manifest: Option<&Value>) -> HashSet<String> {
+    manifest
+        .and_then(|value| value.get("assets"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|asset| asset.get("path").and_then(Value::as_str))
+        .map(normalize_package_path)
+        .filter(|path| is_safe_package_asset_path(path))
+        .collect()
+}
+
+fn extract_markdown_asset_paths(markdown: &str) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for line in markdown.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find("![") {
+            rest = &rest[start..];
+            let Some(open) = rest.find("](") else {
+                break;
+            };
+            let after_open = &rest[(open + 2)..];
+            let Some(close) = after_open.find(')') else {
+                break;
+            };
+            let target = markdown_link_target(&after_open[..close]);
+            if is_local_asset_ref(&target) {
+                let normalized = normalize_package_path(&target);
+                if is_safe_package_asset_path(&normalized) {
+                    paths.insert(normalized);
+                }
+            }
+            rest = &after_open[(close + 1)..];
+        }
+    }
+    paths
+}
+
+fn rewrite_markdown_local_asset_refs(
+    markdown: &str,
+    surface: &str,
+    slug: &str,
+    asset_paths: HashSet<&str>,
+) -> String {
+    let mut rewritten = String::with_capacity(markdown.len());
+    for (line_index, line) in markdown.lines().enumerate() {
+        if line_index > 0 {
+            rewritten.push('\n');
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find("![") {
+            rewritten.push_str(&rest[..start]);
+            rest = &rest[start..];
+            let Some(open) = rest.find("](") else {
+                rewritten.push_str(rest);
+                rest = "";
+                break;
+            };
+            let after_open = &rest[(open + 2)..];
+            let Some(close) = after_open.find(')') else {
+                rewritten.push_str(rest);
+                rest = "";
+                break;
+            };
+            let inside = &after_open[..close];
+            let target = markdown_link_target(inside);
+            let normalized = normalize_package_path(&target);
+            rewritten.push_str(&rest[..(open + 2)]);
+            if is_local_asset_ref(&target) && asset_paths.contains(normalized.as_str()) {
+                rewritten.push_str(&official_asset_url(surface, slug, &normalized));
+            } else {
+                rewritten.push_str(inside);
+            }
+            rewritten.push(')');
+            rest = &after_open[(close + 1)..];
+        }
+        rewritten.push_str(rest);
+    }
+    if markdown.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+fn markdown_link_target(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('<')
+        .trim_matches('>')
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn normalize_package_path(value: &str) -> String {
+    let mut normalized = value.trim().replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    normalized
+}
+
+fn is_local_asset_ref(target: &str) -> bool {
+    let target = target.trim();
+    !target.is_empty()
+        && !target.starts_with("http://")
+        && !target.starts_with("https://")
+        && !target.starts_with("data:")
+        && !target.starts_with('#')
+        && !target.starts_with('/')
+        && !target.starts_with("//")
+        && !target.contains(':')
+}
+
+fn is_safe_package_asset_path(path: &str) -> bool {
+    path.starts_with("assets/")
+        && !path.starts_with('/')
+        && !path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+}
+
+fn official_asset_url(surface: &str, slug: &str, asset_path: &str) -> String {
+    format!(
+        "/api/v1/official-assets/{}/{}/{}",
+        surface.trim_matches('/'),
+        slug.trim_matches('/'),
+        asset_path.trim_start_matches('/')
+    )
+}
+
+fn content_type_for_asset(path: &str, manifest: Option<&Value>) -> String {
+    if let Some(from_manifest) = manifest
+        .and_then(|value| value.get("assets"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|asset| {
+            asset
+                .get("path")
+                .and_then(Value::as_str)
+                .map(normalize_package_path)
+                .as_deref()
+                == Some(path)
+        })
+        .and_then(|asset| asset.get("type").and_then(Value::as_str))
+    {
+        return from_manifest.to_string();
+    }
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
