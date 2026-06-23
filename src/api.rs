@@ -187,6 +187,7 @@ pub struct ExploreArtifactItem {
     pub like_count: Option<u64>,
     pub content_hash: String,
     pub walrus_blob_id: String,
+    pub walrus_blob_object_id: String,
     pub content_type: String,
     pub license: String,
     pub field: String,
@@ -1069,6 +1070,10 @@ async fn explore_item_from_record(
             .as_ref()
             .and_then(|version| version.walrus_blob_id.clone())
             .unwrap_or_else(|| "Not loaded".to_string()),
+        walrus_blob_object_id: latest_version
+            .as_ref()
+            .and_then(|version| version.walrus_blob_object_id.clone())
+            .unwrap_or_default(),
         content_type: latest_version
             .as_ref()
             .and_then(|version| version.content_type.clone())
@@ -1086,7 +1091,8 @@ async fn explore_item_from_record(
 }
 
 async fn hydrate_explore_version(version: &mut VersionRecord) {
-    if explore_raw_has_display_fields(&version.raw_json) {
+    if explore_raw_has_display_fields(&version.raw_json) && version.walrus_blob_object_id.is_some()
+    {
         return;
     }
     let Ok(view) = PaperProofQueryClient::mainnet()
@@ -1104,6 +1110,13 @@ async fn hydrate_explore_version(version: &mut VersionRecord) {
         .walrus_blob_id
         .clone()
         .or_else(|| json_string_path(&version.raw_json, &["header", "fields", "walrus_blob_id"]));
+    version.walrus_blob_object_id = version.walrus_blob_object_id.clone().or_else(|| {
+        json_string_path(
+            &version.raw_json,
+            &["header", "fields", "walrus_blob_object_id"],
+        )
+        .or_else(|| json_string_path(&version.raw_json, &["header", "walrus_blob_object_id"]))
+    });
     version.content_type = version
         .content_type
         .clone()

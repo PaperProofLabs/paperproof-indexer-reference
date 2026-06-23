@@ -7,7 +7,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use paperproof_indexer_reference::{
     ApiConfig, ApiState, ReferenceIndexerConfig, build_cursor_store, build_event_sink,
     content::{PaperProofContentEnricher, default_walrus_content_service},
-    export_airdrop_snapshot,
+    export_airdrop_snapshot, hydrate_version_objects_postgres, hydrate_version_objects_sqlite,
     official_content::OfficialContentConfig,
     rebuild_normalized_from_postgres_raw, rebuild_normalized_from_sqlite_raw,
     replay_jsonl_to_state, run_api_server, run_backfill_once, run_tail_once,
@@ -31,6 +31,7 @@ enum Commands {
     Tail(TailArgs),
     Replay(ReplayArgs),
     RebuildNormalized(RebuildNormalizedArgs),
+    HydrateVersionObjects(HydrateVersionObjectsArgs),
     Airdrop(AirdropArgs),
     CheckDeployment(DeploymentCheckArgs),
     EnrichContent(EnrichArgs),
@@ -77,6 +78,22 @@ struct RebuildNormalizedArgs {
     postgres_url: Option<String>,
     #[arg(long, action = ArgAction::Set, default_value_t = true)]
     clear_existing: bool,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct HydrateVersionObjectsArgs {
+    #[arg(long, value_enum, default_value_t = StorageBackend::Sqlite)]
+    backend: StorageBackend,
+    #[arg(
+        long,
+        env = "PAPERPROOF_INDEXER_SQLITE_PATH",
+        default_value = "artifacts/indexer-mainnet/paperproof-indexer-reference.sqlite"
+    )]
+    sqlite_path: String,
+    #[arg(long, env = "PAPERPROOF_INDEXER_POSTGRES_URL")]
+    postgres_url: Option<String>,
+    #[arg(long)]
+    limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -350,6 +367,23 @@ async fn main() -> paperproof_sdk_rs::Result<()> {
                         )
                     })?;
                     rebuild_normalized_from_postgres_raw(&url, args.clear_existing).await?
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Commands::HydrateVersionObjects(args) => {
+            let report = match args.backend {
+                StorageBackend::Sqlite => {
+                    hydrate_version_objects_sqlite(&args.sqlite_path, args.limit).await?
+                }
+                StorageBackend::Postgres => {
+                    let url = args.postgres_url.ok_or_else(|| {
+                        paperproof_sdk_rs::PaperProofError::invalid_input(
+                            "PAPERPROOF_INDEXER_POSTGRES_URL",
+                            "set --postgres-url or PAPERPROOF_INDEXER_POSTGRES_URL",
+                        )
+                    })?;
+                    hydrate_version_objects_postgres(&url, args.limit).await?
                 }
             };
             println!("{}", serde_json::to_string_pretty(&report)?);

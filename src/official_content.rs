@@ -489,6 +489,11 @@ async fn read_version_fallback(
     let version = query.read.get_version_view(version_id).await?;
     let walrus_blob_id = string_path(&version.raw_fields, &["header", "fields", "walrus_blob_id"])
         .or_else(|| string_path(&version.raw_fields, &["header", "walrus_blob_id"]));
+    let walrus_blob_object_id = string_path(
+        &version.raw_fields,
+        &["header", "fields", "walrus_blob_object_id"],
+    )
+    .or_else(|| string_path(&version.raw_fields, &["header", "walrus_blob_object_id"]));
     Ok(VersionRecord {
         version_id: version.id,
         series_id: version.series_id.unwrap_or_default(),
@@ -496,6 +501,7 @@ async fn read_version_fallback(
         version: version.version,
         content_hash: version.content_hash,
         walrus_blob_id,
+        walrus_blob_object_id,
         content_type: None,
         created_at: None,
         raw_json: version.raw_fields,

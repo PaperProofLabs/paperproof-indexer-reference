@@ -58,6 +58,7 @@ create table if not exists domain_versions (
     version bigint,
     content_hash text,
     walrus_blob_id text,
+    walrus_blob_object_id text,
     content_type text,
     created_at timestamptz,
     raw_json jsonb not null

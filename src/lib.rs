@@ -32,8 +32,10 @@ pub use content::{
 pub use metrics::IndexerMetricSnapshot;
 pub use normalized::{
     AirdropFormat, AirdropRow, ArtifactRecord, CommentRecord, GovernanceProposalRecord,
-    GovernanceVoteRecord, NormalizedQuery, RebuildReport, VersionRecord, export_airdrop_snapshot,
-    rebuild_normalized_from_postgres_raw, rebuild_normalized_from_sqlite_raw,
+    GovernanceVoteRecord, NormalizedQuery, RebuildReport, VersionObjectHydrationReport,
+    VersionRecord, export_airdrop_snapshot, hydrate_version_objects_postgres,
+    hydrate_version_objects_sqlite, rebuild_normalized_from_postgres_raw,
+    rebuild_normalized_from_sqlite_raw,
 };
 pub use pipeline::{
     BackfillReport, ReplayReport, TailReport, replay_jsonl_to_state, run_backfill_once,

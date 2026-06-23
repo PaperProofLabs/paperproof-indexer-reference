@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+use paperproof_sdk_rs::PaperProofQueryClient;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use paperproof_sdk_rs::{IndexedPaperProofEvent, events::PaperProofEventKind};
 use paperproof_sdk_rs::{IndexerEventBatch, PaperProofError};
 
@@ -32,6 +34,7 @@ pub struct VersionRecord {
     pub version: Option<u64>,
     pub content_hash: Option<String>,
     pub walrus_blob_id: Option<String>,
+    pub walrus_blob_object_id: Option<String>,
     pub content_type: Option<String>,
     pub created_at: Option<String>,
     pub raw_json: Value,
@@ -109,6 +112,15 @@ pub struct RebuildReport {
     pub events_seen: u64,
     pub events_applied: u64,
     pub normalized_tables_cleared: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VersionObjectHydrationReport {
+    pub source: String,
+    pub scanned_versions: u64,
+    pub hydrated_versions: u64,
+    pub missing_versions: u64,
+    pub failed_versions: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,7 +279,7 @@ impl NormalizedQuery {
     pub fn versions(&self, series_id: &str) -> paperproof_sdk_rs::Result<Vec<VersionRecord>> {
         let conn = self.connection()?;
         let mut stmt = conn
-            .prepare("select version_id, series_id, artifact_type, version, content_hash, walrus_blob_id, content_type, created_at, raw_json from domain_versions where series_id = ?1 order by version asc, created_at asc")
+            .prepare("select version_id, series_id, artifact_type, version, content_hash, walrus_blob_id, walrus_blob_object_id, content_type, created_at, raw_json from domain_versions where series_id = ?1 order by version asc, created_at asc")
             .map_err(sqlite_err("prepare versions"))?;
         stmt.query_map([series_id], version_from_row)
             .map_err(sqlite_err("query versions"))?
@@ -466,6 +478,7 @@ impl PostgresNormalizedQuery {
             .batch_execute(crate::schema::POSTGRES_REFERENCE_SCHEMA)
             .await
             .map_err(postgres_err("ensure postgres query schema"))?;
+        ensure_postgres_schema_compat(&client).await?;
         Ok(Self {
             client: std::sync::Arc::new(tokio::sync::Mutex::new(client)),
         })
@@ -602,7 +615,7 @@ impl PostgresNormalizedQuery {
         let rows = client
             .query(
                 "select version_id, series_id, artifact_type, version, content_hash,
-                        walrus_blob_id, content_type, created_at::text, raw_json
+                        walrus_blob_id, walrus_blob_object_id, content_type, created_at::text, raw_json
                  from domain_versions
                  where series_id = $1
                  order by version asc, created_at asc",
@@ -929,6 +942,7 @@ pub async fn apply_normalized_batch_postgres(
         .batch_execute(crate::schema::POSTGRES_REFERENCE_SCHEMA)
         .await
         .map_err(postgres_err("ensure postgres normalized schema"))?;
+    ensure_postgres_schema_compat(&client).await?;
     for event in &batch.accepted {
         apply_event_postgres(&client, event).await?;
     }
@@ -943,6 +957,181 @@ pub async fn apply_normalized_batch_postgres(
     Err(PaperProofError::invalid_input(
         "postgres",
         "Postgres normalized projection requires --features postgres",
+    ))
+}
+
+#[cfg(feature = "sqlite")]
+pub async fn hydrate_version_objects_sqlite(
+    db_path: &str,
+    limit: Option<u64>,
+) -> paperproof_sdk_rs::Result<VersionObjectHydrationReport> {
+    let conn =
+        rusqlite::Connection::open(db_path).map_err(sqlite_err("open normalized database"))?;
+    ensure_sqlite_schema(&conn)?;
+    let query = PaperProofQueryClient::mainnet();
+    let max_rows = limit.unwrap_or(10_000);
+    let version_ids = {
+        let mut stmt = conn
+            .prepare(
+                "select version_id from domain_versions
+                 where walrus_blob_object_id is null or walrus_blob_object_id = ''
+                 order by created_at asc, version asc
+                 limit ?1",
+            )
+            .map_err(sqlite_err("prepare version object hydration"))?;
+        stmt.query_map([u64_to_i64(max_rows)?], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err("query version object hydration"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_err("read version object hydration"))?
+    };
+    let mut report = VersionObjectHydrationReport {
+        source: db_path.to_string(),
+        scanned_versions: version_ids.len() as u64,
+        ..Default::default()
+    };
+    for version_id in version_ids {
+        match query.read.get_version_view(&version_id).await {
+            Ok(view) => {
+                if let Some(blob_object_id) =
+                    version_raw_field(&view.raw_fields, "walrus_blob_object_id")
+                {
+                    let raw_json = serde_json::to_string(&view.raw_fields)?;
+                    conn.execute(
+                        "update domain_versions
+                         set walrus_blob_object_id = ?1,
+                             raw_json = ?2,
+                             artifact_type = coalesce(?3, artifact_type),
+                             version = coalesce(?4, version),
+                             content_hash = coalesce(?5, content_hash),
+                             walrus_blob_id = coalesce(?6, walrus_blob_id),
+                             content_type = coalesce(?7, content_type)
+                         where version_id = ?8",
+                        rusqlite::params![
+                            blob_object_id,
+                            raw_json,
+                            opt_u64_to_i64(view.artifact_type.map(u64::from))?,
+                            opt_u64_to_i64(view.version)?,
+                            view.content_hash,
+                            version_raw_field(&view.raw_fields, "walrus_blob_id"),
+                            version_raw_field(&view.raw_fields, "content_type"),
+                            version_id,
+                        ],
+                    )
+                    .map_err(sqlite_err("update hydrated version object"))?;
+                    report.hydrated_versions += 1;
+                } else {
+                    report.missing_versions += 1;
+                }
+            }
+            Err(_) => {
+                report.failed_versions += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(feature = "postgres")]
+pub async fn hydrate_version_objects_postgres(
+    connection_string: &str,
+    limit: Option<u64>,
+) -> paperproof_sdk_rs::Result<VersionObjectHydrationReport> {
+    let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
+        .await
+        .map_err(postgres_err("connect postgres version object hydration"))?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("paperproof postgres hydration connection closed: {error}");
+        }
+    });
+    client
+        .batch_execute(crate::schema::POSTGRES_REFERENCE_SCHEMA)
+        .await
+        .map_err(postgres_err("ensure postgres hydration schema"))?;
+    ensure_postgres_schema_compat(&client).await?;
+    let query = PaperProofQueryClient::mainnet();
+    let max_rows = limit.unwrap_or(10_000);
+    let rows = client
+        .query(
+            "select version_id from domain_versions
+             where walrus_blob_object_id is null or walrus_blob_object_id = ''
+             order by created_at asc, version asc
+             limit $1",
+            &[&u64_to_i64_pg(max_rows)?],
+        )
+        .await
+        .map_err(postgres_err("postgres query version object hydration"))?;
+    let version_ids = rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    let mut report = VersionObjectHydrationReport {
+        source: connection_string.to_string(),
+        scanned_versions: version_ids.len() as u64,
+        ..Default::default()
+    };
+    for version_id in version_ids {
+        match query.read.get_version_view(&version_id).await {
+            Ok(view) => {
+                if let Some(blob_object_id) =
+                    version_raw_field(&view.raw_fields, "walrus_blob_object_id")
+                {
+                    client
+                        .execute(
+                            "update domain_versions
+                             set walrus_blob_object_id = $1,
+                                 raw_json = $2,
+                                 artifact_type = coalesce($3, artifact_type),
+                                 version = coalesce($4, version),
+                                 content_hash = coalesce($5, content_hash),
+                                 walrus_blob_id = coalesce($6, walrus_blob_id),
+                                 content_type = coalesce($7, content_type)
+                             where version_id = $8",
+                            &[
+                                &blob_object_id,
+                                &view.raw_fields,
+                                &opt_u64_to_i64_pg(view.artifact_type.map(u64::from))?,
+                                &opt_u64_to_i64_pg(view.version)?,
+                                &view.content_hash,
+                                &version_raw_field(&view.raw_fields, "walrus_blob_id"),
+                                &version_raw_field(&view.raw_fields, "content_type"),
+                                &version_id,
+                            ],
+                        )
+                        .await
+                        .map_err(postgres_err("postgres update hydrated version object"))?;
+                    report.hydrated_versions += 1;
+                } else {
+                    report.missing_versions += 1;
+                }
+            }
+            Err(_) => {
+                report.failed_versions += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub async fn hydrate_version_objects_sqlite(
+    _db_path: &str,
+    _limit: Option<u64>,
+) -> paperproof_sdk_rs::Result<VersionObjectHydrationReport> {
+    Err(PaperProofError::invalid_input(
+        "sqlite",
+        "SQLite version object hydration requires --features sqlite",
+    ))
+}
+
+#[cfg(not(feature = "postgres"))]
+pub async fn hydrate_version_objects_postgres(
+    _connection_string: &str,
+    _limit: Option<u64>,
+) -> paperproof_sdk_rs::Result<VersionObjectHydrationReport> {
+    Err(PaperProofError::invalid_input(
+        "postgres",
+        "Postgres version object hydration requires --features postgres",
     ))
 }
 
@@ -999,6 +1188,7 @@ pub async fn rebuild_normalized_from_postgres_raw(
         .batch_execute(crate::schema::POSTGRES_REFERENCE_SCHEMA)
         .await
         .map_err(postgres_err("ensure postgres rebuild schema"))?;
+    ensure_postgres_schema_compat(&client).await?;
     if clear_existing {
         clear_normalized_postgres(&client).await?;
     }
@@ -1356,7 +1546,38 @@ fn apply_event(
 #[cfg(feature = "sqlite")]
 fn ensure_sqlite_schema(conn: &rusqlite::Connection) -> paperproof_sdk_rs::Result<()> {
     conn.execute_batch(crate::schema::SQLITE_REFERENCE_SCHEMA)
-        .map_err(sqlite_err("ensure normalized schema"))
+        .map_err(sqlite_err("ensure normalized schema"))?;
+    conn.execute(
+        "alter table domain_versions add column walrus_blob_object_id text",
+        [],
+    )
+    .or_else(|error| {
+        let message = error.to_string();
+        if message.contains("duplicate column name") {
+            Ok(0)
+        } else {
+            Err(error)
+        }
+    })
+    .map_err(sqlite_err(
+        "ensure domain_versions walrus blob object column",
+    ))?;
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+async fn ensure_postgres_schema_compat(
+    client: &tokio_postgres::Client,
+) -> paperproof_sdk_rs::Result<()> {
+    client
+        .batch_execute(
+            "alter table domain_versions
+             add column if not exists walrus_blob_object_id text;",
+        )
+        .await
+        .map_err(postgres_err(
+            "ensure postgres domain_versions walrus blob object column",
+        ))
 }
 
 #[cfg(feature = "sqlite")]
@@ -1575,14 +1796,15 @@ fn insert_version(
     conn.execute(
         "insert into domain_versions (
             version_id, series_id, artifact_type, version, content_hash,
-            walrus_blob_id, content_type, created_at, raw_json
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            walrus_blob_id, walrus_blob_object_id, content_type, created_at, raw_json
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         on conflict(version_id) do update set
             series_id = excluded.series_id,
             artifact_type = coalesce(excluded.artifact_type, domain_versions.artifact_type),
             version = coalesce(excluded.version, domain_versions.version),
             content_hash = coalesce(excluded.content_hash, domain_versions.content_hash),
             walrus_blob_id = coalesce(excluded.walrus_blob_id, domain_versions.walrus_blob_id),
+            walrus_blob_object_id = coalesce(excluded.walrus_blob_object_id, domain_versions.walrus_blob_object_id),
             content_type = coalesce(excluded.content_type, domain_versions.content_type),
             raw_json = excluded.raw_json",
         rusqlite::params![
@@ -1592,6 +1814,8 @@ fn insert_version(
             opt_u64_to_i64(u64_field(fields, "version"))?,
             str_field(fields, "content_hash"),
             str_field(fields, "walrus_blob_id").or_else(|| str_field(fields, "blob_id")),
+            str_field(fields, "walrus_blob_object_id")
+                .or_else(|| str_field(fields, "blob_object_id")),
             str_field(fields, "content_type"),
             created_at,
             raw,
@@ -2008,14 +2232,15 @@ async fn insert_version_postgres(
         .execute(
             "insert into domain_versions (
                 version_id, series_id, artifact_type, version, content_hash,
-                walrus_blob_id, content_type, created_at, raw_json
-            ) values ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::double precision / 1000), $9)
+                walrus_blob_id, walrus_blob_object_id, content_type, created_at, raw_json
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::double precision / 1000), $10)
             on conflict(version_id) do update set
                 series_id = excluded.series_id,
                 artifact_type = coalesce(excluded.artifact_type, domain_versions.artifact_type),
                 version = coalesce(excluded.version, domain_versions.version),
                 content_hash = coalesce(excluded.content_hash, domain_versions.content_hash),
                 walrus_blob_id = coalesce(excluded.walrus_blob_id, domain_versions.walrus_blob_id),
+                walrus_blob_object_id = coalesce(excluded.walrus_blob_object_id, domain_versions.walrus_blob_object_id),
                 content_type = coalesce(excluded.content_type, domain_versions.content_type),
                 raw_json = excluded.raw_json",
             &[
@@ -2025,6 +2250,8 @@ async fn insert_version_postgres(
                 &opt_u64_to_i64_pg(u64_field(fields, "version"))?,
                 &str_field(fields, "content_hash"),
                 &str_field(fields, "walrus_blob_id").or_else(|| str_field(fields, "blob_id")),
+                &str_field(fields, "walrus_blob_object_id")
+                    .or_else(|| str_field(fields, "blob_object_id")),
                 &str_field(fields, "content_type"),
                 &created_at,
                 raw,
@@ -2161,6 +2388,17 @@ fn str_field(fields: &Value, key: &str) -> Option<String> {
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn version_raw_field(fields: &Value, key: &str) -> Option<String> {
+    fields
+        .get("header")
+        .and_then(|header| header.get("fields").or(Some(header)))
+        .and_then(|header| header.get(key))
+        .or_else(|| fields.get(key))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn u64_field(fields: &Value, key: &str) -> Option<u64> {
     fields
         .get(key)
@@ -2194,9 +2432,10 @@ fn version_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VersionRecord> 
         version: opt_i64_to_u64(row.get(3)?)?,
         content_hash: row.get(4)?,
         walrus_blob_id: row.get(5)?,
-        content_type: row.get(6)?,
-        created_at: row.get(7)?,
-        raw_json: json_from_row(row, 8)?,
+        walrus_blob_object_id: row.get(6)?,
+        content_type: row.get(7)?,
+        created_at: row.get(8)?,
+        raw_json: json_from_row(row, 9)?,
     })
 }
 
@@ -2289,9 +2528,10 @@ fn pg_version_from_row(row: &tokio_postgres::Row) -> paperproof_sdk_rs::Result<V
         version: opt_i64_to_u64_pg(row.get(3))?,
         content_hash: row.get(4),
         walrus_blob_id: row.get(5),
-        content_type: row.get(6),
-        created_at: row.get(7),
-        raw_json: row.get(8),
+        walrus_blob_object_id: row.get(6),
+        content_type: row.get(7),
+        created_at: row.get(8),
+        raw_json: row.get(9),
     })
 }
 
