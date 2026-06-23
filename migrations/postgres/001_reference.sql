@@ -164,3 +164,30 @@ create table if not exists paperproof_indexer_metric_samples (
 
 create index if not exists paperproof_indexer_metric_samples_name_idx
     on paperproof_indexer_metric_samples(name, recorded_at desc);
+
+create table if not exists site_visit_events (
+    id bigserial primary key,
+    occurred_at timestamptz not null default now(),
+    week_start text not null,
+    visitor_id_hash text,
+    ip_hash text,
+    fallback_visitor_key text,
+    user_agent_hash text,
+    path text not null,
+    referrer text,
+    language text,
+    timezone text,
+    screen text,
+    device_pixel_ratio text,
+    platform text,
+    country text
+);
+
+create index if not exists site_visit_events_week_idx
+    on site_visit_events(week_start, occurred_at desc);
+
+create index if not exists site_visit_events_visitor_week_idx
+    on site_visit_events(week_start, visitor_id_hash);
+
+create index if not exists site_visit_events_path_week_idx
+    on site_visit_events(week_start, path);

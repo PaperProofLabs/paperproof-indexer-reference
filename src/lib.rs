@@ -20,6 +20,7 @@ pub mod normalized;
 pub mod official_content;
 pub mod pipeline;
 pub mod schema;
+pub mod site_analytics;
 pub mod store;
 
 pub use analytics::{AirdropSnapshotPlan, AnalyticsSummary};

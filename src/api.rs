@@ -4,9 +4,9 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,6 +29,10 @@ use crate::official_content::{
     OfficialContentService, OfficialContentWarmupReport, OfficialDocsManifest,
     OfficialForumManifest, blog_entries, blog_entry, docs_entries, docs_entry, forum_entries,
     forum_entry, official_cache_key,
+};
+use crate::site_analytics::{
+    ObservedVisit, SiteAnalyticsConfig, SiteVisitRequest, SiteVisitResponse, SiteWeeklySummary,
+    record_visit, weekly_summary,
 };
 use paperproof_sdk_rs::PaperProofQueryClient;
 
@@ -53,6 +57,7 @@ pub struct ApiState {
     pub official_content: OfficialContentConfig,
     pub official_cache: OfficialContentCache,
     pub explore_cache: ExploreContentCache,
+    pub site_analytics: SiteAnalyticsConfig,
 }
 
 impl Default for ApiState {
@@ -64,6 +69,7 @@ impl Default for ApiState {
             official_content: OfficialContentConfig::default(),
             official_cache: Arc::new(RwLock::new(HashMap::new())),
             explore_cache: Arc::new(RwLock::new(HashMap::new())),
+            site_analytics: SiteAnalyticsConfig::default(),
         }
     }
 }
@@ -110,6 +116,11 @@ pub struct ActivityParams {
     pub offset: Option<u64>,
     pub actor: Option<String>,
     pub series_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SiteWeeklyParams {
+    pub week_start: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -231,6 +242,8 @@ pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sd
         .route("/health", get(health))
         .route("/v1/analytics/summary", get(analytics))
         .route("/v1/analytics/airdrop-snapshot-plan", get(snapshot_plan))
+        .route("/v1/site-analytics/visit", post(site_analytics_visit))
+        .route("/v1/site-analytics/weekly", get(site_analytics_weekly))
         .route("/metrics", get(metrics))
         .route("/metrics/prometheus", get(prometheus_metrics))
         .route("/v1/explore/summary", get(explore_summary))
@@ -283,6 +296,52 @@ async fn analytics(State(state): State<ApiState>) -> Json<AnalyticsSummary> {
 
 async fn snapshot_plan() -> Json<AirdropSnapshotPlan> {
     Json(AirdropSnapshotPlan::default())
+}
+
+async fn site_analytics_visit(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SiteVisitRequest>,
+) -> Json<SiteVisitResponse> {
+    let observed = ObservedVisit {
+        client_ip: client_ip_from_headers(&headers),
+        user_agent: header_string(&headers, header::USER_AGENT.as_str()),
+        accept_language: header_string(&headers, header::ACCEPT_LANGUAGE.as_str()),
+    };
+    Json(
+        record_visit(
+            state.sqlite_path.as_deref(),
+            state.postgres_url.as_deref(),
+            &state.site_analytics,
+            request,
+            observed,
+        )
+        .await
+        .unwrap_or_else(|error| SiteVisitResponse {
+            recorded: false,
+            reason: Some(error.to_string()),
+        }),
+    )
+}
+
+async fn site_analytics_weekly(
+    State(state): State<ApiState>,
+    Query(params): Query<SiteWeeklyParams>,
+    headers: HeaderMap,
+) -> Result<Json<SiteWeeklySummary>, StatusCode> {
+    let token =
+        bearer_token(&headers).or_else(|| header_string(&headers, "x-paperproof-admin-token"));
+    if !state.site_analytics.admin_allowed(token.as_deref()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    weekly_summary(
+        state.sqlite_path.as_deref(),
+        state.postgres_url.as_deref(),
+        params.week_start.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn metrics(State(state): State<ApiState>) -> Json<MetricsResponse> {
@@ -1295,6 +1354,40 @@ fn now_rfc3339() -> String {
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     format!("unix:{seconds}")
+}
+
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
+    header_string(headers, "x-real-ip")
+        .or_else(|| header_string(headers, "x-forwarded-for"))
+        .map(|value| {
+            value
+                .split(',')
+                .next()
+                .unwrap_or(&value)
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = header_string(headers, header::AUTHORIZATION.as_str())?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 enum ApiQuery {

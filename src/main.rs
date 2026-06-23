@@ -12,6 +12,7 @@ use paperproof_indexer_reference::{
     rebuild_normalized_from_postgres_raw, rebuild_normalized_from_sqlite_raw,
     replay_jsonl_to_state, run_api_server, run_backfill_once, run_tail_once,
     schema::{POSTGRES_REFERENCE_SCHEMA, SQLITE_REFERENCE_SCHEMA},
+    site_analytics::SiteAnalyticsConfig,
 };
 use paperproof_sdk_rs::{IndexerTrustPolicy, PaperProofIndexerClient, PaperProofQueryClient};
 #[cfg(feature = "sui-native")]
@@ -257,6 +258,16 @@ struct ServeArgs {
         default_value_t = 300_000
     )]
     official_refresh_interval_ms: u64,
+    #[arg(
+        long,
+        env = "PAPERPROOF_SITE_ANALYTICS_ENABLED",
+        default_value_t = false
+    )]
+    site_analytics_enabled: bool,
+    #[arg(long, env = "PAPERPROOF_SITE_ANALYTICS_SALT")]
+    site_analytics_salt: Option<String>,
+    #[arg(long, env = "PAPERPROOF_SITE_ANALYTICS_ADMIN_TOKEN")]
+    site_analytics_admin_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -444,6 +455,11 @@ async fn main() -> paperproof_sdk_rs::Result<()> {
                 official_content: OfficialContentConfig {
                     manifest_base_url: args.official_manifest_base_url,
                     walrus_aggregator_url: args.walrus_aggregator_url,
+                },
+                site_analytics: SiteAnalyticsConfig {
+                    enabled: args.site_analytics_enabled,
+                    salt: args.site_analytics_salt,
+                    admin_token: args.site_analytics_admin_token,
                 },
                 ..Default::default()
             };

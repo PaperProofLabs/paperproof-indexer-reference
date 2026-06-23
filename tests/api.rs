@@ -5,6 +5,7 @@
 
 use paperproof_indexer_reference::{
     ApiConfig, ApiState, NormalizedQuery, build_event_sink, run_api_server,
+    site_analytics::SiteAnalyticsConfig,
 };
 use paperproof_sdk_rs::{
     EventId, IndexedPaperProofEvent, IndexerEventBatch, IndexerProgress, PaperProofEventSink,
@@ -241,21 +242,108 @@ async fn api_serves_projected_artifacts_governance_and_airdrop() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn site_analytics_is_disabled_by_default_and_hashes_enabled_visits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("analytics.sqlite");
+    let _ = NormalizedQuery::sqlite(db.to_string_lossy())
+        .summary()
+        .expect("init schema");
+    let (base, handle) = spawn_api(db.to_string_lossy().to_string()).await;
+    let client = local_client();
+    let disabled = client
+        .post(format!("{base}/v1/site-analytics/visit"))
+        .json(&json!({
+            "visitorId": "visitor-a",
+            "path": "/#/explore",
+            "language": "en-US"
+        }))
+        .send()
+        .await
+        .expect("disabled visit request")
+        .json::<Value>()
+        .await
+        .expect("disabled visit json");
+    assert_eq!(disabled["recorded"], false);
+    handle.abort();
+
+    let db_path = db.to_string_lossy().to_string();
+    let (base, handle) = spawn_api_with_state(ApiState {
+        sqlite_path: Some(db_path.clone()),
+        site_analytics: SiteAnalyticsConfig {
+            enabled: true,
+            salt: Some("test-salt".to_string()),
+            admin_token: Some("admin-token".to_string()),
+        },
+        ..Default::default()
+    })
+    .await;
+    let _ = wait_for_json(&client, &format!("{base}/health")).await;
+    for visitor in ["visitor-a", "visitor-b"] {
+        let response = client
+            .post(format!("{base}/v1/site-analytics/visit"))
+            .header("x-real-ip", "203.0.113.10")
+            .header("user-agent", "PaperProof Test Browser")
+            .header("accept-language", "en-US")
+            .json(&json!({
+                "visitorId": visitor,
+                "path": "/#/explore",
+                "language": "en-US",
+                "timezone": "UTC",
+                "screen": "1200x800",
+                "platform": "test"
+            }))
+            .send()
+            .await
+            .expect("enabled visit request")
+            .json::<Value>()
+            .await
+            .expect("enabled visit json");
+        assert_eq!(response["recorded"], true);
+    }
+    let weekly = client
+        .get(format!("{base}/v1/site-analytics/weekly"))
+        .bearer_auth("admin-token")
+        .send()
+        .await
+        .expect("weekly request")
+        .json::<Value>()
+        .await
+        .expect("weekly json");
+    assert_eq!(weekly["visits"], 2);
+    assert_eq!(weekly["uniqueVisitors"], 2);
+    assert_eq!(weekly["uniqueIps"], 1);
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open analytics db");
+    let raw_matches: i64 = conn
+        .query_row(
+            "select count(*) from site_visit_events
+             where visitor_id_hash in ('visitor-a', 'visitor-b')
+                or ip_hash = '203.0.113.10'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("raw check");
+    assert_eq!(raw_matches, 0);
+    handle.abort();
+}
+
 async fn spawn_api(db_path: String) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_api_with_state(ApiState {
+        sqlite_path: Some(db_path),
+        ..Default::default()
+    })
+    .await
+}
+
+async fn spawn_api_with_state(state: ApiState) -> (String, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     drop(listener);
 
     let bind = addr.to_string();
     let handle = tokio::spawn(async move {
-        let _ = run_api_server(
-            ApiConfig { bind },
-            ApiState {
-                sqlite_path: Some(db_path),
-                ..Default::default()
-            },
-        )
-        .await;
+        let _ = run_api_server(ApiConfig { bind }, state).await;
     });
     (format!("http://{addr}"), handle)
 }
