@@ -87,6 +87,7 @@ pub struct ObservedVisit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NormalizedVisit {
+    occurred_at: String,
     visitor_id_hash: Option<String>,
     ip_hash: Option<String>,
     fallback_visitor_key: String,
@@ -224,6 +225,7 @@ fn normalize_visit(
         ],
     );
     NormalizedVisit {
+        occurred_at: current_timestamp_utc_plus_8(),
         visitor_id_hash,
         ip_hash,
         fallback_visitor_key,
@@ -262,10 +264,11 @@ fn record_visit_sqlite(db_path: &str, visit: &NormalizedVisit) -> paperproof_sdk
         .map_err(sqlite_err("ensure site analytics schema"))?;
     conn.execute(
         "insert into site_visit_events (
-            week_start, visitor_id_hash, ip_hash, fallback_visitor_key, user_agent_hash,
+            occurred_at, week_start, visitor_id_hash, ip_hash, fallback_visitor_key, user_agent_hash,
             path, referrer, language, timezone, screen, device_pixel_ratio, platform, country
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         rusqlite::params![
+            visit.occurred_at,
             visit.week_start,
             visit.visitor_id_hash,
             visit.ip_hash,
@@ -313,10 +316,11 @@ async fn record_visit_postgres(
     client
         .execute(
             "insert into site_visit_events (
-                week_start, visitor_id_hash, ip_hash, fallback_visitor_key, user_agent_hash,
+                occurred_at, week_start, visitor_id_hash, ip_hash, fallback_visitor_key, user_agent_hash,
                 path, referrer, language, timezone, screen, device_pixel_ratio, platform, country
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             &[
+                &visit.occurred_at,
                 &visit.week_start,
                 &visit.visitor_id_hash,
                 &visit.ip_hash,
@@ -580,6 +584,25 @@ fn current_week_start_utc() -> String {
     civil_from_days(monday_day)
 }
 
+fn current_timestamp_utc_plus_8() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    timestamp_with_offset(now, 8 * 3_600)
+}
+
+fn timestamp_with_offset(unix_seconds: u64, offset_seconds: i64) -> String {
+    let adjusted = unix_seconds as i64 + offset_seconds;
+    let days = adjusted.div_euclid(86_400);
+    let seconds_of_day = adjusted.rem_euclid(86_400);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let date = civil_from_days(days);
+    format!("{date} {hour:02}:{minute:02}:{second:02}")
+}
+
 fn civil_from_days(days_since_unix_epoch: i64) -> String {
     let z = days_since_unix_epoch + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -655,6 +678,15 @@ mod tests {
         let thursday_1970_01_01: i64 = 0;
         let monday = thursday_1970_01_01 - ((thursday_1970_01_01 + 3).rem_euclid(7));
         assert_eq!(civil_from_days(monday), "1969-12-29");
+    }
+
+    #[test]
+    fn timestamp_offset_formats_as_utc_plus_8() {
+        assert_eq!(timestamp_with_offset(0, 8 * 3_600), "1970-01-01 08:00:00");
+        assert_eq!(
+            timestamp_with_offset(86_399, 8 * 3_600),
+            "1970-01-02 07:59:59"
+        );
     }
 
     #[test]
