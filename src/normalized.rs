@@ -9,6 +9,8 @@ use paperproof_sdk_rs::PaperProofQueryClient;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use paperproof_sdk_rs::{IndexedPaperProofEvent, events::PaperProofEventKind};
 use paperproof_sdk_rs::{IndexerEventBatch, PaperProofError};
+#[cfg(feature = "sqlite")]
+use rusqlite::OptionalExtension;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArtifactRecord {
@@ -1369,7 +1371,21 @@ fn apply_event(
             else {
                 return Ok(());
             };
-            insert_version(conn, fields, &raw, &created_at, &series_id, &version_id)?;
+            let mut version_fields = fields.clone();
+            if version_fields.get("header").is_none() {
+                if let Some(view_fields) = fetch_version_view_sync(&version_id)? {
+                    version_fields = view_fields;
+                }
+            }
+            let version_raw = serde_json::to_string(&version_fields)?;
+            insert_version(
+                conn,
+                &version_fields,
+                &version_raw,
+                &created_at,
+                &series_id,
+                &version_id,
+            )?;
             conn.execute(
                 "update domain_artifacts set latest_version_id = ?1, updated_at = current_timestamp where series_id = ?2",
                 rusqlite::params![version_id, series_id],
@@ -1793,6 +1809,12 @@ fn insert_version(
     series_id: &str,
     version_id: &str,
 ) -> paperproof_sdk_rs::Result<()> {
+    let incoming_raw: Value = serde_json::from_str(raw)?;
+    let merged_raw = merge_version_json(
+        version_row_raw_json_sqlite(conn, version_id)?.as_ref(),
+        &incoming_raw,
+    );
+    let merged_raw_text = serde_json::to_string(&merged_raw)?;
     conn.execute(
         "insert into domain_versions (
             version_id, series_id, artifact_type, version, content_hash,
@@ -1818,7 +1840,7 @@ fn insert_version(
                 .or_else(|| str_field(fields, "blob_object_id")),
             str_field(fields, "content_type"),
             created_at,
-            raw,
+            merged_raw_text,
         ],
     )
     .map_err(sqlite_err("upsert version"))?;
@@ -2026,8 +2048,24 @@ async fn apply_event_postgres(
             else {
                 return Ok(());
             };
-            insert_version_postgres(client, fields, &raw, created_at, &series_id, &version_id)
-                .await?;
+            let mut version_fields = raw.clone();
+            if version_fields.get("header").is_none()
+                && let Ok(view) = PaperProofQueryClient::mainnet()
+                    .read
+                    .get_version_view(&version_id)
+                    .await
+            {
+                version_fields = view.raw_fields;
+            }
+            insert_version_postgres(
+                client,
+                &version_fields,
+                &version_fields,
+                created_at,
+                &series_id,
+                &version_id,
+            )
+            .await?;
             client
                 .execute(
                     "update domain_artifacts set latest_version_id = $1, updated_at = now() where series_id = $2",
@@ -2228,6 +2266,10 @@ async fn insert_version_postgres(
     series_id: &str,
     version_id: &str,
 ) -> paperproof_sdk_rs::Result<()> {
+    let merged_raw = merge_version_json(
+        version_row_raw_json_postgres(client, version_id).await?.as_ref(),
+        raw,
+    );
     client
         .execute(
             "insert into domain_versions (
@@ -2254,7 +2296,7 @@ async fn insert_version_postgres(
                     .or_else(|| str_field(fields, "blob_object_id")),
                 &str_field(fields, "content_type"),
                 &created_at,
-                raw,
+                &merged_raw,
             ],
         )
         .await
@@ -2396,6 +2438,103 @@ fn version_raw_field(fields: &Value, key: &str) -> Option<String> {
         .or_else(|| fields.get(key))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn merge_version_json(existing: Option<&Value>, incoming: &Value) -> Value {
+    let Some(existing) = existing else {
+        return incoming.clone();
+    };
+    if incoming.get("header").is_some() {
+        return incoming.clone();
+    }
+    if existing.get("header").is_some() {
+        let mut merged = existing.clone();
+        if let Some(existing_object) = merged.as_object_mut()
+            && let Some(incoming_object) = incoming.as_object()
+        {
+            for (key, value) in incoming_object {
+                existing_object.insert(key.clone(), value.clone());
+            }
+        }
+        return merged;
+    }
+    incoming.clone()
+}
+
+#[cfg(feature = "sqlite")]
+fn version_row_raw_json_sqlite(
+    conn: &rusqlite::Connection,
+    version_id: &str,
+) -> paperproof_sdk_rs::Result<Option<Value>> {
+    conn.query_row(
+        "select raw_json from domain_versions where version_id = ?1",
+        [version_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(sqlite_err("read existing version raw_json"))?
+    .map(|raw| serde_json::from_str::<Value>(&raw).map_err(Into::into))
+    .transpose()
+}
+
+#[cfg(feature = "sqlite")]
+fn fetch_version_view_sync(version_id: &str) -> paperproof_sdk_rs::Result<Option<Value>> {
+    let version_id_owned = version_id.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            let client = PaperProofQueryClient::mainnet();
+            return Ok(tokio::task::block_in_place(|| {
+                handle
+                    .block_on(client.read.get_version_view(&version_id_owned))
+                    .ok()
+                    .map(|view| view.raw_fields)
+            }));
+        }
+        let join = std::thread::spawn(move || -> paperproof_sdk_rs::Result<Option<Value>> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| {
+                    PaperProofError::network("build temporary tokio runtime", err.to_string())
+                })?;
+            let client = PaperProofQueryClient::mainnet();
+            Ok(runtime
+                .block_on(client.read.get_version_view(&version_id_owned))
+                .ok()
+                .map(|view| view.raw_fields))
+        });
+        return join.join().map_err(|_| {
+            PaperProofError::network(
+                "fetch version view in helper thread",
+                "helper thread panicked".to_string(),
+            )
+        })?;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| PaperProofError::network("build temporary tokio runtime", err.to_string()))?;
+    let client = PaperProofQueryClient::mainnet();
+    Ok(runtime
+        .block_on(client.read.get_version_view(&version_id_owned))
+        .ok()
+        .map(|view| view.raw_fields))
+}
+
+#[cfg(feature = "postgres")]
+async fn version_row_raw_json_postgres(
+    client: &tokio_postgres::Client,
+    version_id: &str,
+) -> paperproof_sdk_rs::Result<Option<Value>> {
+    let row = client
+        .query_opt(
+            "select raw_json from domain_versions where version_id = $1",
+            &[&version_id],
+        )
+        .await
+        .map_err(postgres_err("read existing postgres version raw_json"))?;
+    Ok(row.map(|row| row.get::<_, Value>(0)))
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]

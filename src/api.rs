@@ -541,9 +541,13 @@ async fn artifact_detail(
     Query(params): Query<PageParams>,
 ) -> ApiResult<ArtifactDetailResponse> {
     let query = query(&state).await?;
+    let mut versions = query.versions(&series_id).await?;
+    for version in &mut versions {
+        hydrate_explore_version(version).await;
+    }
     Ok(Json(ArtifactDetailResponse {
         artifact: query.artifact_detail(&series_id).await?,
-        versions: query.versions(&series_id).await?,
+        versions,
         comments: query
             .comments(
                 &series_id,
@@ -558,7 +562,11 @@ async fn artifact_versions(
     State(state): State<ApiState>,
     Path(series_id): Path<String>,
 ) -> ApiResult<Vec<VersionRecord>> {
-    Ok(Json(query(&state).await?.versions(&series_id).await?))
+    let mut versions = query(&state).await?.versions(&series_id).await?;
+    for version in &mut versions {
+        hydrate_explore_version(version).await;
+    }
+    Ok(Json(versions))
 }
 
 async fn artifact_comments(
