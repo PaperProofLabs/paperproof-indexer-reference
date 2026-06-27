@@ -1408,6 +1408,19 @@ fn apply_event(
                 .map_err(sqlite_err("update owner"))?;
             }
         }
+        PaperProofEventKind::ArtifactStatusChanged => {
+            if let Some(series_id) = str_field(fields, "series_id") {
+                conn.execute(
+                    "update domain_artifacts set status = ?1, updated_at = current_timestamp, raw_json = json_set(coalesce(raw_json, '{}'), '$.status', ?2) where series_id = ?3",
+                    rusqlite::params![
+                        opt_u64_to_i64(u64_field(fields, "new_status"))?,
+                        opt_u64_to_i64(u64_field(fields, "new_status"))?,
+                        series_id,
+                    ],
+                )
+                .map_err(sqlite_err("update artifact status"))?;
+            }
+        }
         PaperProofEventKind::CommentAdded => {
             let Some(tree_id) = str_field(fields, "tree_id") else {
                 return Ok(());
@@ -2091,6 +2104,18 @@ async fn apply_event_postgres(
                     )
                     .await
                     .map_err(postgres_err("postgres update owner"))?;
+            }
+        }
+        PaperProofEventKind::ArtifactStatusChanged => {
+            if let Some(series_id) = str_field(fields, "series_id") {
+                let new_status = opt_u64_to_i64_pg(u64_field(fields, "new_status"))?;
+                client
+                    .execute(
+                        "update domain_artifacts set status = $1, updated_at = now(), raw_json = jsonb_set(coalesce(raw_json, '{}'::jsonb), '{status}', to_jsonb($2::bigint), true) where series_id = $3",
+                        &[&new_status, &new_status, &series_id],
+                    )
+                    .await
+                    .map_err(postgres_err("postgres update artifact status"))?;
             }
         }
         PaperProofEventKind::CommentAdded => {

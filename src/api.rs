@@ -1105,10 +1105,10 @@ async fn explore_item_from_record(
         summary: summary_from_explore_raw(artifact_type, &raw),
         owner: record.owner.clone().unwrap_or_default(),
         authors: authors_from_explore_raw(artifact_type, &raw, record.owner.as_deref()),
-        status: if record.status.unwrap_or(0) == 0 {
-            "Active".to_string()
-        } else {
-            "Paused".to_string()
+        status: match record.status.unwrap_or(0) {
+            0 => "Active".to_string(),
+            2 => "Hidden".to_string(),
+            _ => "Paused".to_string(),
         },
         published_at: date_from_timestamp_string(record.published_at.as_deref()),
         updated_at: date_from_timestamp_string(record.updated_at.as_deref()),

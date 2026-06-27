@@ -59,6 +59,17 @@ async fn sqlite_sink_projects_normalized_views_and_airdrop_scores() {
             ),
             event(
                 3,
+                PaperProofEventKind::ArtifactStatusChanged,
+                "ArtifactStatusChangedEvent",
+                json!({
+                    "series_id": "0xseries",
+                    "changed_by": "0xoperator",
+                    "old_status": 0,
+                    "new_status": 2
+                }),
+            ),
+            event(
+                4,
                 PaperProofEventKind::CommentAdded,
                 "CommentAddedEvent",
                 json!({
@@ -70,7 +81,7 @@ async fn sqlite_sink_projects_normalized_views_and_airdrop_scores() {
                 }),
             ),
             event(
-                4,
+                5,
                 PaperProofEventKind::ProposalVoted,
                 "VoteCastEvent",
                 json!({
@@ -81,7 +92,7 @@ async fn sqlite_sink_projects_normalized_views_and_airdrop_scores() {
                 }),
             ),
             event(
-                5,
+                6,
                 PaperProofEventKind::VoteClaimed,
                 "VoteClaimedEvent",
                 json!({
@@ -109,6 +120,7 @@ async fn sqlite_sink_projects_normalized_views_and_airdrop_scores() {
     let artifact = query.artifact_detail("0xseries").expect("detail").unwrap();
     assert_eq!(artifact.latest_version_id.as_deref(), Some("0xversion2"));
     assert_eq!(artifact.comments_tree_id.as_deref(), Some("0xtree"));
+    assert_eq!(artifact.status, Some(2));
 
     let search = query
         .search_artifacts("preprint", Some(1), Some("0xauthor"), 10, 0)
@@ -160,8 +172,8 @@ async fn sqlite_sink_projects_normalized_views_and_airdrop_scores() {
 
     let rebuild = rebuild_normalized_from_sqlite_raw(&db.to_string_lossy(), true)
         .expect("rebuild normalized");
-    assert_eq!(rebuild.events_seen, 5);
-    assert_eq!(rebuild.events_applied, 5);
+    assert_eq!(rebuild.events_seen, 6);
+    assert_eq!(rebuild.events_applied, 6);
     let summary = query.summary().expect("summary after rebuild");
     assert_eq!(summary.total_artifacts, 1);
     assert_eq!(summary.total_versions, 2);
