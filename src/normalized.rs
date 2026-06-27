@@ -1386,11 +1386,51 @@ fn apply_event(
                 &series_id,
                 &version_id,
             )?;
+            let artifact_type = u64_field(&version_fields, "artifact_type")
+                .or_else(|| {
+                    version_fields
+                        .get("header")
+                        .and_then(|header| u64_field(header, "artifact_type"))
+                })
+                .or_else(|| {
+                    version_fields.get("header").and_then(|header| {
+                        header
+                            .get("fields")
+                            .and_then(|nested| u64_field(nested, "artifact_type"))
+                    })
+                });
+            let artifact_title = str_field(&version_fields, "title")
+                .or_else(|| str_field(&version_fields, "project_name"))
+                .or_else(|| {
+                    version_fields
+                        .get("header")
+                        .and_then(|header| str_field(header, "title"))
+                })
+                .or_else(|| {
+                    version_fields.get("header").and_then(|header| {
+                        header
+                            .get("fields")
+                            .and_then(|nested| str_field(nested, "title"))
+                    })
+                });
             conn.execute(
-                "update domain_artifacts set latest_version_id = ?1, updated_at = current_timestamp where series_id = ?2",
-                rusqlite::params![version_id, series_id],
+                "update domain_artifacts
+                 set latest_version_id = ?1,
+                     artifact_type = coalesce(?2, artifact_type),
+                     title = coalesce(?3, title),
+                     updated_at = current_timestamp,
+                     raw_json = json(?4)
+                 where series_id = ?5",
+                rusqlite::params![
+                    version_id,
+                    opt_u64_to_i64(artifact_type)?,
+                    artifact_title,
+                    version_raw,
+                    series_id
+                ],
             )
             .map_err(sqlite_err("update artifact latest version"))?;
+            refresh_artifact_latest_from_versions_sqlite(conn, &series_id)?;
             bump_score(
                 conn,
                 &event.event.sender,
@@ -1813,6 +1853,52 @@ async fn clear_normalized_postgres(
         .map_err(postgres_err("clear postgres normalized tables"))
 }
 
+#[cfg(feature = "postgres")]
+async fn refresh_artifact_latest_from_versions_postgres(
+    client: &tokio_postgres::Client,
+    series_id: &str,
+) -> paperproof_sdk_rs::Result<()> {
+    let latest = client
+        .query_opt(
+            "select version_id, artifact_type, raw_json
+             from domain_versions
+             where series_id = $1
+             order by coalesce(version, 0) desc, coalesce(created_at, to_timestamp(0)) desc, version_id desc
+             limit 1",
+            &[&series_id],
+        )
+        .await
+        .map_err(postgres_err("postgres select latest version for artifact refresh"))?;
+    let Some(row) = latest else {
+        return Ok(());
+    };
+    let latest_version_id = row.get::<_, String>(0);
+    let artifact_type = opt_i64_to_u64_pg(row.get::<_, Option<i64>>(1)?)?;
+    let raw_json: Value = row.get(2);
+    let artifact_type = artifact_type.or_else(|| version_u64_field(&raw_json, "artifact_type"));
+    let artifact_title = version_title_field(&raw_json);
+    client
+        .execute(
+            "update domain_artifacts
+             set latest_version_id = $1,
+                 artifact_type = coalesce($2, artifact_type),
+                 title = coalesce($3, title),
+                 updated_at = now(),
+                 raw_json = $4
+             where series_id = $5",
+            &[
+                &latest_version_id,
+                &opt_u64_to_i64_pg(artifact_type)?,
+                &artifact_title,
+                &raw_json,
+                &series_id,
+            ],
+        )
+        .await
+        .map_err(postgres_err("postgres refresh artifact latest from versions"))?;
+    Ok(())
+}
+
 #[cfg(feature = "sqlite")]
 fn insert_version(
     conn: &rusqlite::Connection,
@@ -1845,22 +1931,23 @@ fn insert_version(
         rusqlite::params![
             version_id,
             series_id,
-            opt_u64_to_i64(u64_field(fields, "artifact_type"))?,
-            opt_u64_to_i64(u64_field(fields, "version"))?,
-            str_field(fields, "content_hash"),
-            str_field(fields, "walrus_blob_id").or_else(|| str_field(fields, "blob_id")),
-            str_field(fields, "walrus_blob_object_id")
-                .or_else(|| str_field(fields, "blob_object_id")),
-            str_field(fields, "content_type"),
+            opt_u64_to_i64(version_u64_field(fields, "artifact_type"))?,
+            opt_u64_to_i64(version_u64_field(fields, "version"))?,
+            version_raw_field(fields, "content_hash"),
+            version_raw_field(fields, "walrus_blob_id")
+                .or_else(|| version_raw_field(fields, "blob_id")),
+            version_raw_field(fields, "walrus_blob_object_id")
+                .or_else(|| version_raw_field(fields, "blob_object_id")),
+            version_raw_field(fields, "content_type"),
             created_at,
             merged_raw_text,
         ],
     )
     .map_err(sqlite_err("upsert version"))?;
     if let Some(blob_id) =
-        str_field(fields, "walrus_blob_id").or_else(|| str_field(fields, "blob_id"))
+        version_raw_field(fields, "walrus_blob_id").or_else(|| version_raw_field(fields, "blob_id"))
     {
-        let expected_sha256_hex = str_field(fields, "content_hash")
+        let expected_sha256_hex = version_raw_field(fields, "content_hash")
             .map(|value| value.trim_start_matches("sha256:").to_string());
         conn.execute(
             "insert into paperproof_content_refs (
@@ -1880,11 +1967,60 @@ fn insert_version(
                 version_id,
                 blob_id,
                 expected_sha256_hex,
-                str_field(fields, "content_type"),
+                version_raw_field(fields, "content_type"),
             ],
         )
         .map_err(sqlite_err("upsert content ref"))?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+fn refresh_artifact_latest_from_versions_sqlite(
+    conn: &rusqlite::Connection,
+    series_id: &str,
+) -> paperproof_sdk_rs::Result<()> {
+    let latest = conn
+        .query_row(
+            "select version_id, artifact_type, raw_json
+             from domain_versions
+             where series_id = ?1
+             order by coalesce(version, 0) desc, coalesce(created_at, '') desc, version_id desc
+             limit 1",
+            [series_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    opt_i64_to_u64(row.get::<_, Option<i64>>(1)?)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_err("select latest version for artifact refresh"))?;
+    let Some((latest_version_id, artifact_type, raw_json_text)) = latest else {
+        return Ok(());
+    };
+    let raw_json: Value = serde_json::from_str(&raw_json_text)?;
+    let artifact_type = artifact_type.or_else(|| version_u64_field(&raw_json, "artifact_type"));
+    let artifact_title = version_title_field(&raw_json);
+    conn.execute(
+        "update domain_artifacts
+         set latest_version_id = ?1,
+             artifact_type = coalesce(?2, artifact_type),
+             title = coalesce(?3, title),
+             updated_at = current_timestamp,
+             raw_json = json(?4)
+         where series_id = ?5",
+        rusqlite::params![
+            latest_version_id,
+            opt_u64_to_i64(artifact_type)?,
+            artifact_title,
+            raw_json_text,
+            series_id,
+        ],
+    )
+    .map_err(sqlite_err("refresh artifact latest from versions"))?;
     Ok(())
 }
 
@@ -2079,13 +2215,53 @@ async fn apply_event_postgres(
                 &version_id,
             )
             .await?;
+            let artifact_type = u64_field(&version_fields, "artifact_type")
+                .or_else(|| {
+                    version_fields
+                        .get("header")
+                        .and_then(|header| u64_field(header, "artifact_type"))
+                })
+                .or_else(|| {
+                    version_fields.get("header").and_then(|header| {
+                        header
+                            .get("fields")
+                            .and_then(|nested| u64_field(nested, "artifact_type"))
+                    })
+                });
+            let artifact_title = str_field(&version_fields, "title")
+                .or_else(|| str_field(&version_fields, "project_name"))
+                .or_else(|| {
+                    version_fields
+                        .get("header")
+                        .and_then(|header| str_field(header, "title"))
+                })
+                .or_else(|| {
+                    version_fields.get("header").and_then(|header| {
+                        header
+                            .get("fields")
+                            .and_then(|nested| str_field(nested, "title"))
+                    })
+                });
             client
                 .execute(
-                    "update domain_artifacts set latest_version_id = $1, updated_at = now() where series_id = $2",
-                    &[&version_id, &series_id],
+                    "update domain_artifacts
+                     set latest_version_id = $1,
+                         artifact_type = coalesce($2, artifact_type),
+                         title = coalesce($3, title),
+                         updated_at = now(),
+                         raw_json = $4
+                     where series_id = $5",
+                    &[
+                        &version_id,
+                        &opt_u64_to_i64_pg(artifact_type)?,
+                        &artifact_title,
+                        &version_fields,
+                        &series_id,
+                    ],
                 )
                 .await
                 .map_err(postgres_err("postgres update latest version"))?;
+            refresh_artifact_latest_from_versions_postgres(client, &series_id).await?;
             bump_score_postgres(
                 client,
                 &event.event.sender,
@@ -2463,6 +2639,30 @@ fn version_raw_field(fields: &Value, key: &str) -> Option<String> {
         .or_else(|| fields.get(key))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn version_u64_field(fields: &Value, key: &str) -> Option<u64> {
+    fields
+        .get("header")
+        .and_then(|header| header.get("fields").or(Some(header)))
+        .and_then(|header| header.get(key))
+        .or_else(|| fields.get(key))
+        .and_then(value_as_u64)
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn version_title_field(fields: &Value) -> Option<String> {
+    version_raw_field(fields, "title").or_else(|| version_raw_field(fields, "project_name"))
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]

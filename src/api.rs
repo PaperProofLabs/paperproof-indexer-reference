@@ -1091,6 +1091,18 @@ async fn explore_item_from_record(
         .map(|version| version.raw_json.clone())
         .unwrap_or_else(|| record.raw_json.clone());
     let comment_count = query.count_comments(&record.series_id).await.ok();
+    let published_at = first_nonempty_date([
+        record.published_at.as_deref(),
+        raw_created_at_date(&record.raw_json).as_deref(),
+    ]);
+    let updated_at = first_nonempty_date([
+        record.updated_at.as_deref(),
+        raw_version
+            .as_ref()
+            .and_then(raw_created_at_date)
+            .as_deref(),
+        raw_created_at_date(&record.raw_json).as_deref(),
+    ]);
     Ok(ExploreArtifactItem {
         series_id: record.series_id.clone(),
         artifact_code: record
@@ -1110,8 +1122,8 @@ async fn explore_item_from_record(
             2 => "Hidden".to_string(),
             _ => "Paused".to_string(),
         },
-        published_at: date_from_timestamp_string(record.published_at.as_deref()),
-        updated_at: date_from_timestamp_string(record.updated_at.as_deref()),
+        published_at,
+        updated_at,
         latest_version_id: record
             .latest_version_id
             .clone()
@@ -1171,7 +1183,10 @@ async fn hydrate_explore_version(version: &mut VersionRecord) {
     };
     version.raw_json = view.raw_fields.clone();
     version.artifact_type = version.artifact_type.or(view.artifact_type.map(u64::from));
-    version.version = version.version.or(view.version);
+    version.version = version.version.or(view.version).or_else(|| {
+        json_u64_path(&version.raw_json, &["header", "fields", "version"])
+            .or_else(|| json_u64_path(&version.raw_json, &["header", "version"]))
+    });
     version.content_hash = version.content_hash.clone().or(view.content_hash);
     version.walrus_blob_id = version
         .walrus_blob_id
@@ -1188,6 +1203,18 @@ async fn hydrate_explore_version(version: &mut VersionRecord) {
         .content_type
         .clone()
         .or_else(|| json_string_path(&version.raw_json, &["header", "fields", "content_type"]));
+}
+
+fn json_u64_path(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    match current {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 fn explore_raw_has_display_fields(value: &serde_json::Value) -> bool {
@@ -1207,18 +1234,27 @@ fn choose_latest_version_for_explore(
     record: &ArtifactRecord,
     versions: &[VersionRecord],
 ) -> Option<VersionRecord> {
+    let best_by_version = versions
+        .iter()
+        .max_by_key(|version| version.version.unwrap_or(0))
+        .cloned();
     if let Some(latest_id) = &record.latest_version_id {
         if let Some(version) = versions
             .iter()
             .find(|version| &version.version_id == latest_id)
         {
+            if best_by_version
+                .as_ref()
+                .and_then(|best| best.version)
+                .unwrap_or(0)
+                > version.version.unwrap_or(0)
+            {
+                return best_by_version;
+            }
             return Some(version.clone());
         }
     }
-    versions
-        .iter()
-        .max_by_key(|version| version.version.unwrap_or(0))
-        .cloned()
+    best_by_version
 }
 
 fn normalize_explore_sort(value: Option<&str>) -> String {
@@ -1340,20 +1376,55 @@ fn json_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> 
     value_to_string(cursor)
 }
 
-fn date_from_timestamp_string(value: Option<&str>) -> String {
+fn raw_created_at_date(value: &serde_json::Value) -> Option<String> {
+    [
+        ["header", "fields", "created_at_ms"].as_slice(),
+        ["header", "created_at_ms"].as_slice(),
+        ["created_at_ms"].as_slice(),
+    ]
+    .into_iter()
+    .find_map(|path| normalized_date_from_timestamp_string(json_string_path(value, path).as_deref()))
+}
+
+fn first_nonempty_date<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> String {
+    values
+        .into_iter()
+        .find_map(normalized_date_from_timestamp_string)
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn normalized_date_from_timestamp_string(value: Option<&str>) -> Option<String> {
     let Some(value) = value else {
-        return "On-chain".to_string();
+        return None;
     };
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("on-chain") {
+        return None;
+    }
     if value.contains('T') {
-        return value.chars().take(10).collect();
+        return Some(value.chars().take(10).collect());
     }
     if let Ok(ms) = value.parse::<u64>() {
         if ms > 0 {
-            let days = ms / 86_400_000;
-            return format!("epoch+{days}d");
+            let days = (ms / 86_400_000) as i64;
+            return Some(civil_from_days(days));
         }
     }
-    value.chars().take(10).collect()
+    Some(value.chars().take(10).collect())
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> String {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}")
 }
 
 fn now_rfc3339() -> String {
