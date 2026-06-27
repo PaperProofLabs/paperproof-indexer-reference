@@ -188,6 +188,66 @@ async fn api_serves_projected_artifacts_governance_and_airdrop() {
     .expect("write batch");
 
     let db = dir.path().join("paperproof-indexer-reference.sqlite");
+    let conn = rusqlite::Connection::open(&db).expect("open sqlite db");
+    conn.execute(
+        "update domain_versions set created_at = null, raw_json = json(?1) where version_id = ?2",
+        rusqlite::params![
+            json!({
+                "artifact_code": "PaperProof-preprint-api-test",
+                "artifact_type": 1,
+                "author": "0xapi_author",
+                "comments_tree_id": "0xapi_tree",
+                "content_hash": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "content_type": "text/plain",
+                "created_at_ms": "1715385600000",
+                "likes_book_id": "0xapi_likes",
+                "series_id": "0xapi_series",
+                "version": "1",
+                "version_id": "0xapi_version_1",
+                "walrus_blob_id": "api-blob-v1"
+            })
+            .to_string(),
+            "0xapi_version_1"
+        ],
+    )
+    .expect("downgrade v1 raw_json to event-style shape");
+    conn.execute(
+        "update domain_versions set created_at = null, raw_json = json(?1) where version_id = ?2",
+        rusqlite::params![
+            json!({
+                "abstract_text": "Updated API test preprint abstract.",
+                "authors": ["API Test Author"],
+                "field": "web3",
+                "header": {
+                    "fields": {
+                        "artifact_type": 1,
+                        "author": "0xapi_author",
+                        "content_hash": "sha256:486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
+                        "content_type": "text/plain",
+                        "created_at_ms": "1715472000000",
+                        "metadata_extensions": [],
+                        "previous_version_id": "0xapi_version_1",
+                        "series_id": "0xapi_series",
+                        "status": 0,
+                        "version": "2",
+                        "walrus_blob_id": "api-blob-v2",
+                        "walrus_blob_object_id": "0xapi_blob_object_v2"
+                    },
+                    "type": "0xapi::publishing::CommonArtifactHeader"
+                },
+                "id": {
+                    "id": "0xapi_version_2"
+                },
+                "keywords": ["api", "test"],
+                "license": "CC-BY-4.0",
+                "title": "API Test Preprint v2"
+            })
+            .to_string(),
+            "0xapi_version_2"
+        ],
+    )
+    .expect("clear v2 created_at while preserving recoverable raw_json");
+    drop(conn);
     let (base, handle) = spawn_api(db.to_string_lossy().to_string()).await;
     let client = local_client();
     let _ = wait_for_json(&client, &format!("{base}/health")).await;
@@ -209,7 +269,27 @@ async fn api_serves_projected_artifacts_governance_and_airdrop() {
         "PaperProof-preprint-api-test"
     );
     assert_eq!(detail["versions"].as_array().expect("versions").len(), 2);
+    assert_eq!(detail["versions"][0]["created_at"], "2024-05-11");
     assert_eq!(detail["comments"].as_array().expect("comments").len(), 1);
+
+    let lookup = wait_for_json(
+        &client,
+        &format!("{base}/v1/artifacts/lookup?q=PaperProof-preprint-api-test"),
+    )
+    .await;
+    assert_eq!(
+        lookup["artifact"]["artifactCode"],
+        "PaperProof-preprint-api-test"
+    );
+    assert_eq!(
+        lookup["versions"]
+            .as_array()
+            .expect("lookup versions")
+            .len(),
+        2
+    );
+    assert_eq!(lookup["versions"][0]["created_at"], "2024-05-11");
+    assert!(lookup["versions"][1]["created_at"].is_string());
 
     let activity = wait_for_json(
         &client,

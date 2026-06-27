@@ -524,7 +524,8 @@ async fn artifact_lookup(
             comments: Vec::new(),
         }));
     };
-    let versions = query.versions(&artifact.series_id).await?;
+    let mut versions = query.versions(&artifact.series_id).await?;
+    hydrate_versions_for_response(&mut versions).await;
     let comments = query.comments(&artifact.series_id, 100, 0).await?;
     let item = explore_item_from_record(&query, artifact, versions.clone()).await?;
     Ok(Json(ExploreLookupResponse {
@@ -542,9 +543,7 @@ async fn artifact_detail(
 ) -> ApiResult<ArtifactDetailResponse> {
     let query = query(&state).await?;
     let mut versions = query.versions(&series_id).await?;
-    for version in &mut versions {
-        hydrate_explore_version(version).await;
-    }
+    hydrate_versions_for_response(&mut versions).await;
     Ok(Json(ArtifactDetailResponse {
         artifact: query.artifact_detail(&series_id).await?,
         versions,
@@ -563,9 +562,7 @@ async fn artifact_versions(
     Path(series_id): Path<String>,
 ) -> ApiResult<Vec<VersionRecord>> {
     let mut versions = query(&state).await?.versions(&series_id).await?;
-    for version in &mut versions {
-        hydrate_explore_version(version).await;
-    }
+    hydrate_versions_for_response(&mut versions).await;
     Ok(Json(versions))
 }
 
@@ -1172,6 +1169,9 @@ async fn explore_item_from_record(
 async fn hydrate_explore_version(version: &mut VersionRecord) {
     if explore_raw_has_display_fields(&version.raw_json) && version.walrus_blob_object_id.is_some()
     {
+        if version.created_at.is_none() {
+            version.created_at = raw_created_at_date(&version.raw_json);
+        }
         return;
     }
     let Ok(view) = PaperProofQueryClient::mainnet()
@@ -1203,6 +1203,18 @@ async fn hydrate_explore_version(version: &mut VersionRecord) {
         .content_type
         .clone()
         .or_else(|| json_string_path(&version.raw_json, &["header", "fields", "content_type"]));
+    if version.created_at.is_none() {
+        version.created_at = raw_created_at_date(&version.raw_json);
+    }
+}
+
+async fn hydrate_versions_for_response(versions: &mut [VersionRecord]) {
+    for version in versions {
+        hydrate_explore_version(version).await;
+        if version.created_at.is_none() {
+            version.created_at = raw_created_at_date(&version.raw_json);
+        }
+    }
 }
 
 fn json_u64_path(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
@@ -1383,7 +1395,9 @@ fn raw_created_at_date(value: &serde_json::Value) -> Option<String> {
         ["created_at_ms"].as_slice(),
     ]
     .into_iter()
-    .find_map(|path| normalized_date_from_timestamp_string(json_string_path(value, path).as_deref()))
+    .find_map(|path| {
+        normalized_date_from_timestamp_string(json_string_path(value, path).as_deref())
+    })
 }
 
 fn first_nonempty_date<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> String {
