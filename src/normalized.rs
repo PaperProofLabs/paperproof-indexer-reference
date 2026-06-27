@@ -1895,7 +1895,9 @@ async fn refresh_artifact_latest_from_versions_postgres(
             ],
         )
         .await
-        .map_err(postgres_err("postgres refresh artifact latest from versions"))?;
+        .map_err(postgres_err(
+            "postgres refresh artifact latest from versions",
+        ))?;
     Ok(())
 }
 
@@ -2468,7 +2470,9 @@ async fn insert_version_postgres(
     version_id: &str,
 ) -> paperproof_sdk_rs::Result<()> {
     let merged_raw = merge_version_json(
-        version_row_raw_json_postgres(client, version_id).await?.as_ref(),
+        version_row_raw_json_postgres(client, version_id)
+            .await?
+            .as_ref(),
         raw,
     );
     client
@@ -2739,7 +2743,9 @@ fn fetch_version_view_sync(version_id: &str) -> paperproof_sdk_rs::Result<Option
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|err| PaperProofError::network("build temporary tokio runtime", err.to_string()))?;
+        .map_err(|err| {
+            PaperProofError::network("build temporary tokio runtime", err.to_string())
+        })?;
     let client = PaperProofQueryClient::mainnet();
     Ok(runtime
         .block_on(client.read.get_version_view(&version_id_owned))
