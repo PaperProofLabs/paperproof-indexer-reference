@@ -195,9 +195,9 @@ impl NormalizedQuery {
     ) -> paperproof_sdk_rs::Result<Vec<ArtifactRecord>> {
         let conn = self.connection()?;
         let sql = if artifact_type.is_some() {
-            "select series_id, artifact_code, artifact_type, owner, latest_version_id, comments_tree_id, likes_book_id, title, status, published_at, updated_at, raw_json from domain_artifacts where artifact_type = ?1 order by coalesce(updated_at, published_at) desc limit ?2 offset ?3"
+            "select series_id, artifact_code, artifact_type, owner, latest_version_id, comments_tree_id, likes_book_id, title, status, published_at, updated_at, raw_json from domain_artifacts where artifact_type = ?1 and coalesce(status, 0) <> 2 order by coalesce(updated_at, published_at) desc limit ?2 offset ?3"
         } else {
-            "select series_id, artifact_code, artifact_type, owner, latest_version_id, comments_tree_id, likes_book_id, title, status, published_at, updated_at, raw_json from domain_artifacts order by coalesce(updated_at, published_at) desc limit ?1 offset ?2"
+            "select series_id, artifact_code, artifact_type, owner, latest_version_id, comments_tree_id, likes_book_id, title, status, published_at, updated_at, raw_json from domain_artifacts where coalesce(status, 0) <> 2 order by coalesce(updated_at, published_at) desc limit ?1 offset ?2"
         };
         let mut stmt = conn.prepare(sql).map_err(sqlite_err("prepare artifacts"))?;
         let rows = if let Some(kind) = artifact_type {
@@ -253,12 +253,12 @@ impl NormalizedQuery {
         let conn = self.connection()?;
         let count = if let Some(kind) = artifact_type {
             let mut stmt = conn
-                .prepare("select count(*) from domain_artifacts where artifact_type = ?1")
+                .prepare("select count(*) from domain_artifacts where artifact_type = ?1 and coalesce(status, 0) <> 2")
                 .map_err(sqlite_err("prepare artifact count"))?;
             stmt.query_row([u64_to_i64(kind)?], |row| row.get::<_, i64>(0))
                 .map_err(sqlite_err("query artifact count"))?
         } else {
-            scalar_i64(&conn, "select count(*) from domain_artifacts")?
+            scalar_i64(&conn, "select count(*) from domain_artifacts where coalesce(status, 0) <> 2")?
         };
         u64::try_from(count).map_err(|err| {
             paperproof_sdk_rs::PaperProofError::invalid_input("artifact count", err.to_string())
@@ -403,6 +403,7 @@ impl NormalizedQuery {
                 where (artifact_code like ?1 or title like ?1 or owner like ?1 or series_id like ?1 or raw_json like ?1)
                   and (?2 is null or artifact_type = ?2)
                   and (?3 is null or lower(owner) = lower(?3))
+                  and coalesce(status, 0) <> 2
                 order by
                   case
                     when artifact_code = ?4 then 0
@@ -537,6 +538,7 @@ impl PostgresNormalizedQuery {
                         published_at::text, updated_at::text, raw_json
                  from domain_artifacts
                  where ($1::bigint is null or artifact_type = $1)
+                   and coalesce(status, 0) <> 2
                  order by coalesce(updated_at, published_at) desc
                  limit $2 offset $3",
                 &[&kind, &u64_to_i64_pg(limit)?, &u64_to_i64_pg(offset)?],
@@ -592,7 +594,7 @@ impl PostgresNormalizedQuery {
         let kind = opt_u64_to_i64_pg(artifact_type)?;
         let row = client
             .query_one(
-                "select count(*) from domain_artifacts where ($1::bigint is null or artifact_type = $1)",
+                "select count(*) from domain_artifacts where ($1::bigint is null or artifact_type = $1) and coalesce(status, 0) <> 2",
                 &[&kind],
             )
             .await
@@ -754,6 +756,7 @@ impl PostgresNormalizedQuery {
                  )
                    and ($2::bigint is null or artifact_type = $2)
                    and ($3::text is null or lower(owner) = lower($3))
+                   and coalesce(status, 0) <> 2
                  order by
                     case
                         when artifact_code = $4 then 0
