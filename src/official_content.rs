@@ -816,8 +816,8 @@ fn official_asset_url(surface: &str, slug: &str, version_id: &str, asset_path: &
     format!(
         "/api/v1/official-assets/{}/{}/{}/{}",
         surface.trim_matches('/'),
-        slug.trim_matches('/'),
         version_id.trim_matches('/'),
+        slug.trim_matches('/'),
         asset_path.trim_start_matches('/')
     )
 }
