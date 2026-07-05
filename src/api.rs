@@ -4,7 +4,7 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -28,7 +28,7 @@ use crate::official_content::{
     OfficialBlogManifest, OfficialContentCache, OfficialContentConfig, OfficialContentResponse,
     OfficialContentService, OfficialContentWarmupReport, OfficialDocsManifest,
     OfficialForumManifest, blog_entries, blog_entry, docs_entries, docs_entry, forum_entries,
-    forum_entry, official_cache_key,
+    forum_entry, official_cache_key, sha256_hex,
 };
 use crate::site_analytics::{
     ObservedVisit, SiteAnalyticsConfig, SiteVisitRequest, SiteVisitResponse, SiteWeeklySummary,
@@ -217,6 +217,10 @@ pub struct ApiError(paperproof_sdk_rs::PaperProofError);
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
+const OFFICIAL_CONTENT_CACHE_CONTROL: &str = "public, max-age=60, stale-while-revalidate=300";
+const OFFICIAL_MANIFEST_CACHE_CONTROL: &str = "public, max-age=60, stale-while-revalidate=300";
+const OFFICIAL_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
 impl From<paperproof_sdk_rs::PaperProofError> for ApiError {
     fn from(value: paperproof_sdk_rs::PaperProofError) -> Self {
         Self(value)
@@ -267,8 +271,11 @@ pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sd
         )
         .route("/v1/official/blog/{slug}", get(official_blog_post))
         .route("/v1/official/forum/{slug}", get(official_forum_topic))
+        .route("/v1/official-manifests/docs", get(official_docs_manifest))
+        .route("/v1/official-manifests/blog", get(official_blog_manifest))
+        .route("/v1/official-manifests/forum", get(official_forum_manifest))
         .route(
-            "/v1/official-assets/{surface}/{*asset_path}",
+            "/v1/official-assets/{surface}/{version_id}/{*asset_path}",
             get(official_content_asset),
         )
         .with_state(state);
@@ -652,29 +659,32 @@ async fn airdrop_snapshot(State(state): State<ApiState>) -> ApiResult<Vec<Airdro
 
 async fn official_doc_section(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(section): Path<String>,
-) -> ApiResult<OfficialContentResponse> {
-    official_docs_response(state, section, None).await
+) -> Result<Response, ApiError> {
+    official_docs_response(state, headers, section, None).await
 }
 
 async fn official_doc_topic(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path((section, topic)): Path<(String, String)>,
-) -> ApiResult<OfficialContentResponse> {
-    official_docs_response(state, section, Some(topic)).await
+) -> Result<Response, ApiError> {
+    official_docs_response(state, headers, section, Some(topic)).await
 }
 
 async fn official_docs_response(
     state: ApiState,
+    headers: HeaderMap,
     section: String,
     topic: Option<String>,
-) -> ApiResult<OfficialContentResponse> {
+) -> Result<Response, ApiError> {
     let slug = topic
         .as_ref()
         .map(|topic| format!("{section}/{topic}"))
         .unwrap_or_else(|| section.clone());
     if let Some(cached) = cached_official_content(&state, "docs", &slug).await {
-        return Ok(Json(cached));
+        return Ok(official_content_response(&headers, &cached));
     }
     let service = OfficialContentService::new(state.official_content.clone());
     let manifest = service
@@ -692,15 +702,16 @@ async fn official_docs_response(
     let versions = official_versions_or_empty(&state, &series_id).await;
     let rendered = service.render_entry("docs", &slug, entry, versions).await?;
     cache_official_content(&state, &rendered).await;
-    Ok(Json(rendered))
+    Ok(official_content_response(&headers, &rendered))
 }
 
 async fn official_blog_post(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(slug): Path<String>,
-) -> ApiResult<OfficialContentResponse> {
+) -> Result<Response, ApiError> {
     if let Some(cached) = cached_official_content(&state, "blog", &slug).await {
-        return Ok(Json(cached));
+        return Ok(official_content_response(&headers, &cached));
     }
     let service = OfficialContentService::new(state.official_content.clone());
     let manifest = service
@@ -718,15 +729,16 @@ async fn official_blog_post(
     let versions = official_versions_or_empty(&state, &series_id).await;
     let rendered = service.render_entry("blog", &slug, entry, versions).await?;
     cache_official_content(&state, &rendered).await;
-    Ok(Json(rendered))
+    Ok(official_content_response(&headers, &rendered))
 }
 
 async fn official_forum_topic(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(slug): Path<String>,
-) -> ApiResult<OfficialContentResponse> {
+) -> Result<Response, ApiError> {
     if let Some(cached) = cached_official_content(&state, "forum", &slug).await {
-        return Ok(Json(cached));
+        return Ok(official_content_response(&headers, &cached));
     }
     let service = OfficialContentService::new(state.official_content.clone());
     let manifest = service
@@ -746,12 +758,12 @@ async fn official_forum_topic(
         .render_entry("forum", &slug, entry, versions)
         .await?;
     cache_official_content(&state, &rendered).await;
-    Ok(Json(rendered))
+    Ok(official_content_response(&headers, &rendered))
 }
 
 async fn official_content_asset(
     State(state): State<ApiState>,
-    Path((surface, asset_path)): Path<(String, String)>,
+    Path((surface, version_id, asset_path)): Path<(String, String, String)>,
 ) -> Response {
     let mut parts = asset_path.split('/').collect::<Vec<_>>();
     if parts.len() < 2 {
@@ -779,17 +791,108 @@ async fn official_content_asset(
     let Some(cached) = cached else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if !cached.version_id.eq_ignore_ascii_case(&version_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let Some(asset) = cached.assets.get(&asset_path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     (
         [
             (header::CONTENT_TYPE, asset.content_type.as_str()),
-            (header::CACHE_CONTROL, "public, max-age=300"),
+            (header::CACHE_CONTROL, OFFICIAL_ASSET_CACHE_CONTROL),
         ],
         asset.bytes.clone(),
     )
         .into_response()
+}
+
+async fn official_docs_manifest(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    official_manifest_response::<OfficialDocsManifest>(&state, &headers, "docs/manifest.json").await
+}
+
+async fn official_blog_manifest(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    official_manifest_response::<OfficialBlogManifest>(&state, &headers, "blog/manifest.json").await
+}
+
+async fn official_forum_manifest(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    official_manifest_response::<OfficialForumManifest>(&state, &headers, "forum/manifest.json").await
+}
+
+async fn official_manifest_response<T>(
+    state: &ApiState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Response, ApiError>
+where
+    T: serde::Serialize + for<'de> serde::Deserialize<'de>,
+{
+    let service = OfficialContentService::new(state.official_content.clone());
+    let manifest = service.load_manifest::<T>(path).await?;
+    let bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        ApiError(paperproof_sdk_rs::PaperProofError::invalid_input("official manifest json", error.to_string()))
+    })?;
+    let etag = format!("\"pp-manifest:{}\"", sha256_hex(&bytes));
+    if let Some(value) = header_string(headers, header::IF_NONE_MATCH.as_str()) {
+        if value.trim() == etag {
+            return Ok((
+                StatusCode::NOT_MODIFIED,
+                [
+                    (header::ETAG, etag.as_str()),
+                    (header::CACHE_CONTROL, OFFICIAL_MANIFEST_CACHE_CONTROL),
+                ],
+            )
+                .into_response());
+        }
+    }
+    let mut response = Json(manifest).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(OFFICIAL_MANIFEST_CACHE_CONTROL),
+    );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    Ok(response)
+}
+
+fn official_content_response(headers: &HeaderMap, rendered: &OfficialContentResponse) -> Response {
+  if let Some(value) = header_string(headers, header::IF_NONE_MATCH.as_str()) {
+    if value.trim() == rendered.cache_tag {
+      return (
+        StatusCode::NOT_MODIFIED,
+        [
+          (header::ETAG, rendered.cache_tag.as_str()),
+          (header::CACHE_CONTROL, OFFICIAL_CONTENT_CACHE_CONTROL),
+        ],
+      )
+        .into_response();
+    }
+  }
+
+  let mut response = Json(rendered.clone()).into_response();
+  response.headers_mut().insert(
+    header::CACHE_CONTROL,
+    HeaderValue::from_static(OFFICIAL_CONTENT_CACHE_CONTROL),
+  );
+  if let Ok(value) = HeaderValue::from_str(&rendered.cache_tag) {
+    response.headers_mut().insert(header::ETAG, value);
+  }
+  if let Some(last_modified) = rendered.cache_last_modified.as_deref() {
+    if let Ok(value) = HeaderValue::from_str(last_modified) {
+      response.headers_mut().insert(header::LAST_MODIFIED, value);
+    }
+  }
+  response
 }
 
 async fn cached_official_content(

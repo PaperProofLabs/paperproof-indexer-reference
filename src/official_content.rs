@@ -36,6 +36,10 @@ pub struct OfficialContentResponse {
     pub asset_paths: Vec<String>,
     #[serde(skip)]
     pub assets: HashMap<String, OfficialContentAsset>,
+    #[serde(skip)]
+    pub cache_tag: String,
+    #[serde(skip)]
+    pub cache_last_modified: Option<String>,
     pub manifest_entry: Value,
 }
 
@@ -55,7 +59,7 @@ pub struct OfficialContentWarmupReport {
     pub errors: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialDocsManifest {
     pub sections: Vec<OfficialDocsSection>,
@@ -93,7 +97,7 @@ pub struct OfficialDocsTopic {
     pub content_type: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialBlogManifest {
     pub posts: Vec<OfficialBlogPost>,
@@ -114,13 +118,13 @@ pub struct OfficialBlogPost {
     pub content_type: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialForumManifest {
     pub sections: Vec<OfficialForumSection>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialForumSection {
     pub topics: Vec<OfficialForumTopic>,
@@ -254,9 +258,12 @@ impl OfficialContentService {
             &markdown,
             surface,
             slug,
+            &version.version_id,
             package.assets.keys().map(String::as_str).collect(),
         );
         let asset_paths = package.assets.keys().cloned().collect();
+        let version_id = version.version_id.clone();
+        let cache_tag = official_content_cache_tag(&series_id, &version_id, &actual_hash);
         Ok(OfficialContentResponse {
             surface: surface.to_string(),
             slug: slug.to_string(),
@@ -277,6 +284,8 @@ impl OfficialContentService {
             has_local_asset_refs,
             asset_paths,
             assets: package.assets,
+            cache_tag,
+            cache_last_modified: version.created_at.clone(),
             manifest_entry: entry.manifest_entry,
         })
     }
@@ -463,6 +472,15 @@ pub fn official_cache_key(surface: &str, slug: &str) -> String {
     format!("{}:{}", surface, slug.trim_matches('/'))
 }
 
+pub fn official_content_cache_tag(series_id: &str, version_id: &str, content_hash: &str) -> String {
+    format!(
+        "\"pp-official:{}:{}:{}\"",
+        series_id.trim().to_ascii_lowercase(),
+        version_id.trim().to_ascii_lowercase(),
+        normalize_hash(content_hash),
+    )
+}
+
 fn choose_version(versions: &[VersionRecord]) -> Option<VersionRecord> {
     versions
         .iter()
@@ -521,7 +539,7 @@ fn string_path(value: &Value, path: &[&str]) -> Option<String> {
     })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -712,6 +730,7 @@ fn rewrite_markdown_local_asset_refs(
     markdown: &str,
     surface: &str,
     slug: &str,
+    version_id: &str,
     asset_paths: HashSet<&str>,
 ) -> String {
     let mut rewritten = String::with_capacity(markdown.len());
@@ -739,7 +758,7 @@ fn rewrite_markdown_local_asset_refs(
             let normalized = normalize_package_path(&target);
             rewritten.push_str(&rest[..(open + 2)]);
             if is_local_asset_ref(&target) && asset_paths.contains(normalized.as_str()) {
-                rewritten.push_str(&official_asset_url(surface, slug, &normalized));
+                rewritten.push_str(&official_asset_url(surface, slug, version_id, &normalized));
             } else {
                 rewritten.push_str(inside);
             }
@@ -793,11 +812,12 @@ fn is_safe_package_asset_path(path: &str) -> bool {
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
 }
 
-fn official_asset_url(surface: &str, slug: &str, asset_path: &str) -> String {
+fn official_asset_url(surface: &str, slug: &str, version_id: &str, asset_path: &str) -> String {
     format!(
-        "/api/v1/official-assets/{}/{}/{}",
+        "/api/v1/official-assets/{}/{}/{}/{}",
         surface.trim_matches('/'),
         slug.trim_matches('/'),
+        version_id.trim_matches('/'),
         asset_path.trim_start_matches('/')
     )
 }
