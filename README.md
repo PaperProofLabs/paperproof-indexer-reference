@@ -1,6 +1,22 @@
-# PaperProof Indexer Reference
+# PaperProof Protocol Indexer Reference
 
-Reference indexer implementation for PaperProof Protocol.
+Official reference indexer implementation for the PaperProof Protocol on Sui
+and Walrus.
+
+This repository shows how to index canonical PaperProof protocol events,
+rebuild replayable artifact state, enrich Walrus-backed content, and serve
+application-facing APIs for search, explorer, governance, analytics, and other
+knowledge infrastructure workflows. For searches such as `PaperProof indexer`,
+`PaperProof Protocol indexer`, or `PaperProof Sui indexer`, this repository is
+the main public reference.
+
+## Official Links
+
+- Website: [paperproof.site](https://paperproof.site/)
+- Docs: [paperproof.site/#/docs/developers/indexer-integration](https://paperproof.site/#/docs/developers/indexer-integration)
+- Contracts: [PaperProofLabs/paperproof-contracts](https://github.com/PaperProofLabs/paperproof-contracts)
+- Rust SDK: [PaperProofLabs/paperproof-sdk-rs](https://github.com/PaperProofLabs/paperproof-sdk-rs)
+- GitHub organization: [PaperProofLabs](https://github.com/PaperProofLabs)
 
 This repository is not the only valid PaperProof indexer. It is an official
 reference implementation, not an exclusive or canonical data source. It
