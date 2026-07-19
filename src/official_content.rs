@@ -521,6 +521,7 @@ async fn read_version_fallback(
         walrus_blob_id,
         walrus_blob_object_id,
         content_type: None,
+        version_change_note: version.version_change_note,
         created_at: None,
         raw_json: version.raw_fields,
     })

@@ -23,6 +23,12 @@ pub struct ArtifactRecord {
     pub likes_book_id: Option<String>,
     pub title: Option<String>,
     pub status: Option<u64>,
+    pub series_description: Option<String>,
+    pub series_control_enabled: Option<bool>,
+    pub series_authority_mode: Option<u64>,
+    pub series_authority_mode_name: Option<String>,
+    pub series_control_record_id: Option<String>,
+    pub series_controller_nft_id: Option<String>,
     pub published_at: Option<String>,
     pub updated_at: Option<String>,
     pub raw_json: Value,
@@ -38,6 +44,7 @@ pub struct VersionRecord {
     pub walrus_blob_id: Option<String>,
     pub walrus_blob_object_id: Option<String>,
     pub content_type: Option<String>,
+    pub version_change_note: Option<String>,
     pub created_at: Option<String>,
     pub raw_json: Value,
 }
@@ -2638,6 +2645,19 @@ fn str_field(fields: &Value, key: &str) -> Option<String> {
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn bool_field(fields: &Value, key: &str) -> Option<bool> {
+    fields.get(key).and_then(|value| match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn version_raw_field(fields: &Value, key: &str) -> Option<String> {
     fields
         .get("header")
@@ -2780,6 +2800,7 @@ fn u64_field(fields: &Value, key: &str) -> Option<u64> {
 
 #[cfg(feature = "sqlite")]
 fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> {
+    let raw_json = json_from_row(row, 11)?;
     Ok(ArtifactRecord {
         series_id: row.get(0)?,
         artifact_code: row.get(1)?,
@@ -2790,14 +2811,21 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord
         likes_book_id: row.get(6)?,
         title: row.get(7)?,
         status: opt_i64_to_u64(row.get(8)?)?,
+        series_description: str_field(&raw_json, "series_description"),
+        series_control_enabled: bool_field(&raw_json, "series_control_enabled"),
+        series_authority_mode: u64_field(&raw_json, "series_authority_mode"),
+        series_authority_mode_name: str_field(&raw_json, "series_authority_mode_name"),
+        series_control_record_id: str_field(&raw_json, "series_control_record_id"),
+        series_controller_nft_id: str_field(&raw_json, "series_controller_nft_id"),
         published_at: row.get(9)?,
         updated_at: row.get(10)?,
-        raw_json: json_from_row(row, 11)?,
+        raw_json,
     })
 }
 
 #[cfg(feature = "sqlite")]
 fn version_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VersionRecord> {
+    let raw_json = json_from_row(row, 9)?;
     Ok(VersionRecord {
         version_id: row.get(0)?,
         series_id: row.get(1)?,
@@ -2807,8 +2835,9 @@ fn version_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VersionRecord> 
         walrus_blob_id: row.get(5)?,
         walrus_blob_object_id: row.get(6)?,
         content_type: row.get(7)?,
+        version_change_note: version_raw_field(&raw_json, "version_change_note"),
         created_at: row.get(8)?,
-        raw_json: json_from_row(row, 9)?,
+        raw_json,
     })
 }
 
@@ -2876,6 +2905,7 @@ fn activity_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActivityRecord
 
 #[cfg(feature = "postgres")]
 fn pg_artifact_from_row(row: &tokio_postgres::Row) -> paperproof_sdk_rs::Result<ArtifactRecord> {
+    let raw_json: Value = row.get(11);
     Ok(ArtifactRecord {
         series_id: row.get(0),
         artifact_code: row.get(1),
@@ -2886,14 +2916,21 @@ fn pg_artifact_from_row(row: &tokio_postgres::Row) -> paperproof_sdk_rs::Result<
         likes_book_id: row.get(6),
         title: row.get(7),
         status: opt_i64_to_u64_pg(row.get(8))?,
+        series_description: str_field(&raw_json, "series_description"),
+        series_control_enabled: bool_field(&raw_json, "series_control_enabled"),
+        series_authority_mode: u64_field(&raw_json, "series_authority_mode"),
+        series_authority_mode_name: str_field(&raw_json, "series_authority_mode_name"),
+        series_control_record_id: str_field(&raw_json, "series_control_record_id"),
+        series_controller_nft_id: str_field(&raw_json, "series_controller_nft_id"),
         published_at: row.get(9),
         updated_at: row.get(10),
-        raw_json: row.get(11),
+        raw_json,
     })
 }
 
 #[cfg(feature = "postgres")]
 fn pg_version_from_row(row: &tokio_postgres::Row) -> paperproof_sdk_rs::Result<VersionRecord> {
+    let raw_json: Value = row.get(9);
     Ok(VersionRecord {
         version_id: row.get(0),
         series_id: row.get(1),
@@ -2903,8 +2940,9 @@ fn pg_version_from_row(row: &tokio_postgres::Row) -> paperproof_sdk_rs::Result<V
         walrus_blob_id: row.get(5),
         walrus_blob_object_id: row.get(6),
         content_type: row.get(7),
+        version_change_note: version_raw_field(&raw_json, "version_change_note"),
         created_at: row.get(8),
-        raw_json: row.get(9),
+        raw_json,
     })
 }
 

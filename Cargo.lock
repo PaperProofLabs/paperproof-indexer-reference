@@ -1290,9 +1290,9 @@ dependencies = [
 
 [[package]]
 name = "paperproof-sdk-rs"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acf5a15a5ac9498040568ebc77d82d8fdbf07f5448e12f8e9d7636e26888345"
+checksum = "1b67daa180e3ca208af2ca5d854c34cf82a9b1d37a916cadf1f079b443c443a6"
 dependencies = [
  "async-trait",
  "base64",

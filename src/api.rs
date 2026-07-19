@@ -178,6 +178,17 @@ pub struct ExploreLookupResponse {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ControlledArtifactsResponse {
+    pub refreshed_at: String,
+    pub address: String,
+    pub limit: u64,
+    pub offset: u64,
+    pub has_more: bool,
+    pub items: Vec<ExploreArtifactItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExploreArtifactItem {
     pub series_id: String,
     pub artifact_code: String,
@@ -192,8 +203,21 @@ pub struct ExploreArtifactItem {
     pub updated_at: String,
     pub latest_version_id: String,
     pub latest_version_number: u64,
+    pub latest_version_change_note: Option<String>,
     pub comments_tree_id: String,
     pub likes_book_id: String,
+    pub series_description: Option<String>,
+    pub series_control_enabled: Option<bool>,
+    pub series_authority_mode: Option<u64>,
+    pub series_authority_mode_name: Option<String>,
+    pub series_control_record_id: Option<String>,
+    pub series_controller_nft_id: Option<String>,
+    pub controller_holder: Option<String>,
+    pub current_controller_mirror: Option<String>,
+    pub legacy_series_owner_mirror: Option<String>,
+    pub legacy_comments_owner_mirror: Option<String>,
+    pub controller_mirror_stale: Option<bool>,
+    pub controller_transfer_locked: Option<bool>,
     pub comment_count: Option<u64>,
     pub like_count: Option<u64>,
     pub content_hash: String,
@@ -262,7 +286,9 @@ pub async fn run_api_server(config: ApiConfig, state: ApiState) -> paperproof_sd
         .route("/v1/activity", get(activity_feed))
         .route("/v1/governance/proposals", get(governance_proposals))
         .route("/v1/my/{address}/artifacts", get(my_artifacts))
+        .route("/v1/my/{address}/controlled-artifacts", get(my_controlled_artifacts))
         .route("/v1/my/{address}/votes", get(my_votes))
+        .route("/v1/controller/{controller_nft_id}/artifact", get(controller_artifact_lookup))
         .route("/v1/airdrop/snapshot", get(airdrop_snapshot))
         .route("/v1/official/docs/{section}", get(official_doc_section))
         .route(
@@ -551,8 +577,12 @@ async fn artifact_detail(
     let query = query(&state).await?;
     let mut versions = query.versions(&series_id).await?;
     hydrate_versions_for_response(&mut versions).await;
+    let mut artifact = query.artifact_detail(&series_id).await?;
+    if let Some(record) = artifact.as_mut() {
+        hydrate_artifact_record(record).await;
+    }
     Ok(Json(ArtifactDetailResponse {
-        artifact: query.artifact_detail(&series_id).await?,
+        artifact,
         versions,
         comments: query
             .comments(
@@ -634,6 +664,71 @@ async fn my_artifacts(
             )
             .await?,
     ))
+}
+
+async fn my_controlled_artifacts(
+    State(state): State<ApiState>,
+    Path(address): Path<String>,
+    Query(params): Query<PageParams>,
+) -> ApiResult<ControlledArtifactsResponse> {
+    let limit = params.limit.unwrap_or(20).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).min(5_000);
+    let query = query(&state).await?;
+    let items = all_explore_artifacts(&query).await?;
+    let normalized = address.trim().to_ascii_lowercase();
+    let matching = items
+        .into_iter()
+        .filter(|item| {
+            item.controller_holder
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase() == normalized)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(matching.len());
+    let end = start
+        .saturating_add(usize::try_from(limit).unwrap_or(0))
+        .min(matching.len());
+    let page_items = matching[start..end].to_vec();
+    Ok(Json(ControlledArtifactsResponse {
+        refreshed_at: now_rfc3339(),
+        address,
+        limit,
+        offset,
+        has_more: end < matching.len(),
+        items: page_items,
+    }))
+}
+
+async fn controller_artifact_lookup(
+    State(state): State<ApiState>,
+    Path(controller_nft_id): Path<String>,
+) -> ApiResult<ExploreLookupResponse> {
+    let query = query(&state).await?;
+    let items = all_explore_artifacts(&query).await?;
+    let normalized = controller_nft_id.trim().to_ascii_lowercase();
+    let Some(artifact) = items.into_iter().find(|item| {
+        item.series_controller_nft_id
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase() == normalized)
+            .unwrap_or(false)
+    }) else {
+        return Ok(Json(ExploreLookupResponse {
+            refreshed_at: now_rfc3339(),
+            artifact: None,
+            versions: Vec::new(),
+            comments: Vec::new(),
+        }));
+    };
+    let mut versions = query.versions(&artifact.series_id).await?;
+    hydrate_versions_for_response(&mut versions).await;
+    let comments = query.comments(&artifact.series_id, 100, 0).await?;
+    Ok(Json(ExploreLookupResponse {
+        refreshed_at: now_rfc3339(),
+        artifact: Some(artifact),
+        versions,
+        comments,
+    }))
 }
 
 async fn my_votes(
@@ -1173,11 +1268,46 @@ async fn explore_items_from_records(
     Ok(items)
 }
 
+async fn all_explore_artifacts(
+    query: &ApiQuery,
+) -> paperproof_sdk_rs::Result<Vec<ExploreArtifactItem>> {
+    let total = query.count_artifacts(None).await?.min(5_000);
+    let page_size = 200u64;
+    let mut offset = 0;
+    let mut records = Vec::new();
+    while offset < total {
+        let batch = query.recent_artifacts(None, page_size, offset).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len() as u64;
+        records.extend(batch);
+        if batch_len < page_size {
+            break;
+        }
+        offset += page_size;
+    }
+    explore_items_from_records(query, records).await
+}
+
 async fn explore_item_from_record(
     query: &ApiQuery,
-    record: ArtifactRecord,
+    mut record: ArtifactRecord,
     versions: Vec<VersionRecord>,
 ) -> paperproof_sdk_rs::Result<ExploreArtifactItem> {
+    hydrate_artifact_record(&mut record).await;
+    let control_snapshot = if record.series_control_enabled == Some(true)
+        || record.series_control_record_id.is_some()
+        || record.series_controller_nft_id.is_some()
+    {
+        PaperProofQueryClient::mainnet()
+            .read
+            .get_series_control_snapshot(&record.series_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let artifact_type = record.artifact_type.unwrap_or(0);
     let mut latest_version = choose_latest_version_for_explore(&record, &versions);
     if let Some(version) = latest_version.as_mut() {
@@ -1237,8 +1367,35 @@ async fn explore_item_from_record(
             .as_ref()
             .and_then(|version| version.version)
             .unwrap_or(1),
+        latest_version_change_note: latest_version
+            .as_ref()
+            .and_then(|version| version.version_change_note.clone()),
         comments_tree_id: record.comments_tree_id.clone().unwrap_or_default(),
         likes_book_id: record.likes_book_id.clone().unwrap_or_default(),
+        series_description: record.series_description.clone(),
+        series_control_enabled: record.series_control_enabled,
+        series_authority_mode: record.series_authority_mode,
+        series_authority_mode_name: record.series_authority_mode_name.clone(),
+        series_control_record_id: record.series_control_record_id.clone(),
+        series_controller_nft_id: record.series_controller_nft_id.clone(),
+        controller_holder: control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.controller_holder.clone()),
+        current_controller_mirror: control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.current_controller_mirror.clone()),
+        legacy_series_owner_mirror: control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.legacy_series_owner_mirror.clone()),
+        legacy_comments_owner_mirror: control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.legacy_comments_owner_mirror.clone()),
+        controller_mirror_stale: control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.mirror_stale),
+        controller_transfer_locked: control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.transfer_locked),
         comment_count,
         like_count: None,
         content_hash: latest_version
@@ -1272,6 +1429,10 @@ async fn explore_item_from_record(
 async fn hydrate_explore_version(version: &mut VersionRecord) {
     if explore_raw_has_display_fields(&version.raw_json) && version.walrus_blob_object_id.is_some()
     {
+        if version.version_change_note.is_none() {
+            version.version_change_note =
+                json_string_path(&version.raw_json, &["version_change_note"]);
+        }
         if version.created_at.is_none() {
             version.created_at = raw_created_at_date(&version.raw_json);
         }
@@ -1291,6 +1452,11 @@ async fn hydrate_explore_version(version: &mut VersionRecord) {
             .or_else(|| json_u64_path(&version.raw_json, &["header", "version"]))
     });
     version.content_hash = version.content_hash.clone().or(view.content_hash);
+    version.version_change_note = version
+        .version_change_note
+        .clone()
+        .or(view.version_change_note)
+        .or_else(|| json_string_path(&version.raw_json, &["version_change_note"]));
     version.walrus_blob_id = version
         .walrus_blob_id
         .clone()
@@ -1318,6 +1484,54 @@ async fn hydrate_versions_for_response(versions: &mut [VersionRecord]) {
             version.created_at = raw_created_at_date(&version.raw_json);
         }
     }
+}
+
+async fn hydrate_artifact_record(record: &mut ArtifactRecord) {
+    let Ok(view) = PaperProofQueryClient::mainnet()
+        .read
+        .get_series_view(&record.series_id)
+        .await
+    else {
+        return;
+    };
+    record.artifact_code = view.artifact_code.clone().or(record.artifact_code.clone());
+    record.artifact_type = view
+        .artifact_type
+        .map(u64::from)
+        .or(record.artifact_type);
+    record.owner = view.owner.clone().or(record.owner.clone());
+    record.latest_version_id = view
+        .current_version_id
+        .clone()
+        .or(record.latest_version_id.clone());
+    record.comments_tree_id = view
+        .comments_tree_id
+        .clone()
+        .or(record.comments_tree_id.clone());
+    record.likes_book_id = view.likes_book_id.clone().or(record.likes_book_id.clone());
+    record.status = view.status.map(u64::from).or(record.status);
+    record.series_description = view
+        .series_description
+        .clone()
+        .or(record.series_description.clone());
+    record.series_control_enabled = view
+        .series_control_enabled
+        .or(record.series_control_enabled);
+    record.series_authority_mode = view
+        .series_authority_mode
+        .or(record.series_authority_mode);
+    record.series_authority_mode_name = view
+        .series_authority_mode_name
+        .clone()
+        .or(record.series_authority_mode_name.clone());
+    record.series_control_record_id = view
+        .series_control_record_id
+        .clone()
+        .or(record.series_control_record_id.clone());
+    record.series_controller_nft_id = view
+        .series_controller_nft_id
+        .clone()
+        .or(record.series_controller_nft_id.clone());
 }
 
 fn json_u64_path(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
