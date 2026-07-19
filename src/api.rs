@@ -213,10 +213,6 @@ pub struct ExploreArtifactItem {
     pub series_control_record_id: Option<String>,
     pub series_controller_nft_id: Option<String>,
     pub controller_holder: Option<String>,
-    pub current_controller_mirror: Option<String>,
-    pub legacy_series_owner_mirror: Option<String>,
-    pub legacy_comments_owner_mirror: Option<String>,
-    pub controller_mirror_stale: Option<bool>,
     pub controller_transfer_locked: Option<bool>,
     pub comment_count: Option<u64>,
     pub like_count: Option<u64>,
@@ -1381,18 +1377,6 @@ async fn explore_item_from_record(
         controller_holder: control_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.controller_holder.clone()),
-        current_controller_mirror: control_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.current_controller_mirror.clone()),
-        legacy_series_owner_mirror: control_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.legacy_series_owner_mirror.clone()),
-        legacy_comments_owner_mirror: control_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.legacy_comments_owner_mirror.clone()),
-        controller_mirror_stale: control_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.mirror_stale),
         controller_transfer_locked: control_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.transfer_locked),

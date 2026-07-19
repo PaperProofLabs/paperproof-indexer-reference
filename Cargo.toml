@@ -11,7 +11,7 @@ readme = "README.md"
 async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
-paperproof-sdk-rs = { version = "0.2.5", features = ["async"] }
+paperproof-sdk-rs = { version = "0.3.0", features = ["async"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.32", optional = true }
 serde = { version = "1", features = ["derive"] }
