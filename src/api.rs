@@ -223,7 +223,9 @@ pub struct ExploreArtifactItem {
     pub license: String,
     pub field: String,
     pub keywords: Vec<String>,
-    pub raw_artifact: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_artifact: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_version: Option<serde_json::Value>,
 }
 
@@ -1405,8 +1407,8 @@ async fn explore_item_from_record(
         } else {
             string_list_field(&raw, "keywords")
         },
-        raw_artifact: record.raw_json,
-        raw_version,
+        raw_artifact: None,
+        raw_version: None,
     })
 }
 
